@@ -223,4 +223,4 @@ SD:/switch/.overlays/sdv_items.ovl
   其余全是代码，没有地图数据、没有别的 `.xnb`
 - 基于 GPLv2 的 [exlaunch](https://github.com/shadowninja108/exlaunch) 构建，
   许可证见 `LICENSE`，第三方声明见 `NOTICE.md`
-- 只在实机 + Atmosphère 上测过，模拟器没测
+- 所有功能均已在实机（Atmosphère系统）上测过。
