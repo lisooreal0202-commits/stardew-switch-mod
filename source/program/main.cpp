@@ -312,6 +312,16 @@ namespace {
      * while the TV said rain -- a different static, not this one. */
     constexpr uintptr_t kWeatherTomorrowSlotOff =
         SDV_OFF(kWeatherTomorrowSlotOff, 0xBBCAF28u);
+    /* The authoritative forecast lives in netWorldState, and the TV reads it
+     * there whenever it is not the host.  Game1.weatherForTomorrow mirrors it
+     * but is a copy: in the first few days it still holds the current day's
+     * weather, which is why the HUD lagged a day while the TV was right. */
+    constexpr uintptr_t kNetWorldStateSlotOff =
+        SDV_OFF(kNetWorldStateSlotOff, 0xBBBBBF0u);
+    constexpr uintptr_t kGetWeatherForLocationOff =
+        SDV_OFF(kGetWeatherForLocationOff, 0x1995D60u);
+    constexpr uintptr_t kGetWeatherTomorrowOff =
+        SDV_OFF(kGetWeatherTomorrowOff, 0x197AA70u);
     /* Farmer.daysLeftForToolUpgrade is a NetInt at +0x5B8. */
     constexpr unsigned  kFarmerToolUpgradeDaysOff = 0x5B8u;
     /* Off while the feature is being proven on hardware. */
@@ -17132,6 +17142,7 @@ namespace {
      * the update hook calls it, and it must stay out of the draw path: see the
      * comment on the definition. */
     void BuildHudStrings();
+    void SampleWeather();
 
     void HookGameUpdate(void* self, void* gameTime) {
         EnsureSettings();
@@ -17191,6 +17202,7 @@ namespace {
                 s_toolFrame = 0;
                 SampleToolUpgrade();
             }
+            SampleWeather();
             /* Strings are built here, not in the draw hook: ManagedStr
              * allocates a managed object, and allocating while the game is
              * mid-draw can trigger a collection that locks the console up. */
@@ -18381,6 +18393,10 @@ namespace {
      * while the TV said rain.  Strings are immutable in .NET, so a new value
      * is always a new pointer. */
     void* s_weatherPtr = nullptr;
+    void* s_weatherCtx = nullptr;   /* the "Default" context string */
+    void* s_weatherLoc = nullptr;   /* LocationWeather for that context */
+    void* s_weatherNet = nullptr;   /* its WeatherForTomorrow */
+    int   s_weatherFrame = 0;
 
     /* Reads a managed String.  Layout from the metadata: length at +0x10, the
      * first UTF-16 character at +0x14. */
@@ -18575,9 +18591,56 @@ namespace {
      * it changes, so it looked like a random freeze rather than a repeatable
      * one.  Same rule as v392: managed calls live in update, draw only reads.
      */
-    /* Two hops: the cached slot pointer, then the string itself.  Either hop
-     * can be null early in a load, so both are checked. */
+    /* Sampled once a second from the update hook: GetWeatherForLocation is a
+     * dictionary lookup and the getter is a managed call, neither of which may
+     * happen while drawing. */
+    void SampleWeather() {
+        if (++s_weatherFrame < 60) {
+            return;
+        }
+        s_weatherFrame = 0;
+        if (s_weatherCtx == nullptr || !Plausible(s_weatherCtx)) {
+            s_weatherCtx = ManagedStr(u"Default");
+        }
+        if (s_weatherCtx == nullptr) {
+            return;
+        }
+        if (s_weatherLoc == nullptr || !Plausible(s_weatherLoc)) {
+            void** slot =
+                *reinterpret_cast<void***>(g_base + kNetWorldStateSlotOff);
+            if (slot == nullptr || !Plausible(slot)) {
+                return;
+            }
+            void* netRef = *slot;
+            if (netRef == nullptr || !Plausible(netRef)) {
+                return;
+            }
+            void* nws = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(netRef) + 0x68);
+            if (nws == nullptr || !Plausible(nws)) {
+                return;
+            }
+            auto getLoc = reinterpret_cast<void* (*)(void*, void*)>(
+                g_base + kGetWeatherForLocationOff);
+            s_weatherLoc = getLoc(nws, s_weatherCtx);
+        }
+        if (s_weatherLoc == nullptr || !Plausible(s_weatherLoc)) {
+            return;
+        }
+        auto getW = reinterpret_cast<void* (*)(void*)>(
+            g_base + kGetWeatherTomorrowOff);
+        void* w = getW(s_weatherLoc);
+        if (w != nullptr && Plausible(w)) {
+            s_weatherNet = w;
+        }
+    }
+
+    /* netWorldState first; the static copy is only a fallback for the frames
+     * before the first sample lands. */
     void* WeatherTomorrow() {
+        if (s_weatherNet != nullptr && Plausible(s_weatherNet)) {
+            return s_weatherNet;
+        }
         void** slot =
             *reinterpret_cast<void***>(g_base + kWeatherTomorrowSlotOff);
         if (slot == nullptr || !Plausible(slot)) {
