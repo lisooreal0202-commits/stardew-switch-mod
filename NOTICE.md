@@ -5,9 +5,9 @@
 This mod is built on [exlaunch](https://github.com/shadowninja108/exlaunch)
 by shadowninja108, which is licensed under the GNU General Public License v2.
 The full licence text is in `LICENSE`. Because the shipped `subsdk8` links
-that code, the corresponding source travels as a separate archive next to
-this one on the same release page -- GPLv2 requires it to accompany the binary,
-not to clutter the repository.
+that code, the corresponding source is in this repository, under `source/`.
+GPLv2 requires it to be available to whoever receives the binary, so it is
+kept next to the thing it builds rather than behind a separate download.
 
 ## Stardew Valley
 
