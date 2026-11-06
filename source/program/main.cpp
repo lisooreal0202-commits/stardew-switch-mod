@@ -17122,6 +17122,11 @@ namespace {
         }
     }
 
+    /* Defined further down with the rest of the HUD.  Declared here because
+     * the update hook calls it, and it must stay out of the draw path: see the
+     * comment on the definition. */
+    void BuildHudStrings();
+
     void HookGameUpdate(void* self, void* gameTime) {
         EnsureSettings();
         if (s_saveAskFrame < 0xFFFFu) {
@@ -17180,6 +17185,10 @@ namespace {
                 s_toolFrame = 0;
                 SampleToolUpgrade();
             }
+            /* Strings are built here, not in the draw hook: ManagedStr
+             * allocates a managed object, and allocating while the game is
+             * mid-draw can trigger a collection that locks the console up. */
+            BuildHudStrings();
         }
         if (s_origGameUpdate != nullptr) {
             s_origGameUpdate(self, gameTime);
@@ -18353,7 +18362,8 @@ namespace {
         drawString(batch, font, msg, colour, x, y);
     }
 
-    int  s_lastUpgradeDays = -1;
+    int  s_lastUpgradeDays = -1;   /* >0: draw the tool row */
+    int  s_upgradeShown = -1;      /* value s_upgradeLine was built from */
     CachedStr s_upgradeLine{nullptr, 0, 0};
     CachedStr s_weatherLine{nullptr, 0, 0};
     CachedStr s_luckLine{nullptr, 0, 0};
@@ -18542,10 +18552,21 @@ namespace {
         return WeatherSlot(str);
     }
 
-    void DrawHudInfo() {
+    /* Builds the three HUD strings.  Runs in the update hook, never while
+     * drawing.
+     *
+     * ManagedStr calls String::.ctor, which allocates a managed object.  Doing
+     * that from the draw path can trigger a collection while the game holds
+     * the sprite batch, and the console locks up -- hard reset only.  It is
+     * intermittent by nature: a string is rebuilt only when the value behind
+     * it changes, so it looked like a random freeze rather than a repeatable
+     * one.  Same rule as v392: managed calls live in update, draw only reads.
+     */
+    void BuildHudStrings() {
         if (!kHudInfo) {
             return;
         }
+
         /* Tomorrow's weather.  Rebuilt only when the calendar day changes. */
         void* weather = *reinterpret_cast<void**>(g_base + kWeatherTomorrowOff);
         const int season = *reinterpret_cast<const int*>(g_base + kSeasonOff);
@@ -18590,29 +18611,8 @@ namespace {
             buf[n] = 0;
             CachedStrBuild(&s_weatherLine, buf, n);
         }
-        DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
-        if (kIconProbe) {
-            /* Our own art, encoded as filled rectangles: no texture to load.
-             * The slot is null until that icon has been drawn, so a missing
-             * icon simply shows the text alone instead of drawing garbage. */
-            const int idx = WeatherIconIndex(weather);
-            if (idx >= 0 && idx < kWeatherIconCount &&
-                kWeatherIcons[idx].count > 0) {
-                void* white =
-                    *reinterpret_cast<void**>(g_base + kStaminaRectOff);
-                if (Plausible(white)) {
-                    DrawIconRuns(white, kWeatherIcons[idx].runs,
-                                 kWeatherIcons[idx].count,
-                                 kHudIconX, kHudIconY, kHudIconScale);
-                }
-            }
-        }
 
-        /* Daily luck.  Icon comes from the game's own cursor sheet -- the same
-         * 10x14 region UI Info Suite 2 uses -- tinted by tier so the colour
-         * answers the question before you read the number.  The text is
-         * rebuilt only when the number changes, because ManagedStr allocates
-         * a managed object every call and this runs every frame. */
+        /* Daily luck.  s_luckHundredths is sampled once a second in update. */
         if (s_luckHundredths != s_luckShown || !CachedStrOk(s_luckLine)) {
             s_luckShown = s_luckHundredths;
             char16_t buf[32];
@@ -18632,8 +18632,72 @@ namespace {
             buf[n] = 0;
             CachedStrBuild(&s_luckLine, buf, n);
         }
-        DrawHudString(s_luckLine.obj, kHudTextX, kHudLuckTextY,
-                      0xFFFFFFFFu);
+
+        /* Tool upgrade countdown.  s_lastUpgradeDays is only the "does this row
+         * exist" flag the draw path reads; s_upgradeShown is what the string
+         * was built from, so clearing the flag does not force a rebuild. */
+        s_lastUpgradeDays = -1;
+        void* pl = CarryPlayer();
+        if (pl == nullptr) {
+            return;
+        }
+        void* slot = NetValueSlot(pl, kFarmerToolUpgradeDaysOff, 4u);
+        if (slot == nullptr) {
+            return;
+        }
+        const int days = *reinterpret_cast<int*>(slot);
+        if (days <= 0 || days > 99) {
+            return;
+        }
+        s_lastUpgradeDays = days;
+        if (days != s_upgradeShown || !CachedStrOk(s_upgradeLine)) {
+            char16_t buf[40];
+            int n = 0;
+            const char16_t prefix[] = u"工具升级 剩余 ";
+            for (int i = 0; prefix[i] != 0 && n < 30; i++) {
+                buf[n++] = prefix[i];
+            }
+            n = AppendUnsigned(buf, n, days);
+            const char16_t tail[] = u" 天";
+            for (int i = 0; tail[i] != 0 && n < 36; i++) {
+                buf[n++] = tail[i];
+            }
+            buf[n] = 0;
+            CachedStrBuild(&s_upgradeLine, buf, n);
+            s_upgradeShown = days;
+        }
+    }
+
+    void DrawHudInfo() {
+        if (!kHudInfo) {
+            return;
+        }
+        /* Nothing here may allocate: every string below was built in the
+         * update hook.  DrawHudString ignores a null or implausible object. */
+        DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
+        if (kIconProbe) {
+            /* Our own art, encoded as filled rectangles: no texture to load.
+             * The slot is null until that icon has been drawn, so a missing
+             * icon simply shows the text alone instead of drawing garbage. */
+            void* weather =
+                *reinterpret_cast<void**>(g_base + kWeatherTomorrowOff);
+            const int idx = WeatherIconIndex(weather);
+            if (idx >= 0 && idx < kWeatherIconCount &&
+                kWeatherIcons[idx].count > 0) {
+                void* white =
+                    *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+                if (Plausible(white)) {
+                    DrawIconRuns(white, kWeatherIcons[idx].runs,
+                                 kWeatherIcons[idx].count,
+                                 kHudIconX, kHudIconY, kHudIconScale);
+                }
+            }
+        }
+
+        /* Daily luck.  Icon comes from the game's own cursor sheet -- the same
+         * 10x14 region UI Info Suite 2 uses -- tinted by tier so the colour
+         * answers the question before you read the number. */
+        DrawHudString(s_luckLine.obj, kHudTextX, kHudLuckTextY, 0xFFFFFFFFu);
         {
             void* batch =
                 *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
@@ -18665,81 +18729,48 @@ namespace {
             }
         }
 
-        /* Tool upgrade countdown. */
-        void* pl = CarryPlayer();
-        if (pl == nullptr) {
+        /* Tool upgrade countdown: only when something is actually upgrading. */
+        if (s_lastUpgradeDays <= 0) {
             return;
         }
-        void* slot = NetValueSlot(pl, kFarmerToolUpgradeDaysOff, 4u);
-        if (slot == nullptr) {
+        void* batch = *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
+        void* font = *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
+        if (!Plausible(batch) || !Plausible(font)) {
             return;
         }
-        const int days = *reinterpret_cast<int*>(slot);
-        if (days <= 0 || days > 99) {
-            s_lastUpgradeDays = -1;
-            return;
-        }
-        /* Rebuild when the number changes, or when the GC has taken the
-         * cached object (see CachedStr). */
-        if (days != s_lastUpgradeDays || !CachedStrOk(s_upgradeLine)) {
-            char16_t buf[40];
-            int n = 0;
-            const char16_t prefix[] = u"工具升级 剩余 ";
-            for (int i = 0; prefix[i] != 0 && n < 30; i++) {
-                buf[n++] = prefix[i];
+        /* The tool's own sprite when we have it, our hammer otherwise.  Both
+         * are drawn 64x64 so the row keeps its size either way. */
+        int drew = 0;
+        if (s_toolRectValid != 0 && Plausible(s_toolSheet)) {
+            NullableRect src;
+            src.x = s_toolRectX;
+            src.y = s_toolRectY;
+            src.w = s_toolRectW;
+            src.h = s_toolRectH;
+            src.present = 1;
+            for (int q = 0; q < 7; q++) {
+                src.pad[q] = 0;
             }
-            n = AppendUnsigned(buf, n, days);
-            const char16_t tail[] = u" 天";
-            for (int i = 0; tail[i] != 0 && n < 36; i++) {
-                buf[n++] = tail[i];
-            }
-            buf[n] = 0;
-            CachedStrBuild(&s_upgradeLine, buf, n);
-            s_lastUpgradeDays = days;
+            const u64 dxy =
+                (static_cast<u64>(static_cast<u32>(kHudToolY)) << 32) |
+                static_cast<u32>(kHudToolX);
+            const u64 dwh =
+                (static_cast<u64>(static_cast<u32>(64)) << 32) |
+                static_cast<u32>(64);
+            auto drawSprite =
+                reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+            drawSprite(batch, s_toolSheet, dxy, dwh, &src, 0xFFFFFFFFu,
+                       0.0f, 0.0f, 0.0f, 1.0f, 0);
+            drew = 1;
         }
-        if (s_upgradeLine.obj != nullptr && Plausible(s_upgradeLine.obj)) {
-            void* batch = *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
-            void* font = *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
-            if (Plausible(batch) && Plausible(font)) {
-                /* The tool's own sprite when we have it, our hammer otherwise.
-                 * Both are drawn 64x64 so the row keeps its size either way. */
-                int drew = 0;
-                if (s_toolRectValid != 0 && Plausible(s_toolSheet)) {
-                    NullableRect src;
-                    src.x = s_toolRectX;
-                    src.y = s_toolRectY;
-                    src.w = s_toolRectW;
-                    src.h = s_toolRectH;
-                    src.present = 1;
-                    for (int q = 0; q < 7; q++) {
-                        src.pad[q] = 0;
-                    }
-                    const u64 dxy =
-                        (static_cast<u64>(static_cast<u32>(kHudToolY)) << 32) |
-                        static_cast<u32>(kHudToolX);
-                    const u64 dwh =
-                        (static_cast<u64>(static_cast<u32>(64)) << 32) |
-                        static_cast<u32>(64);
-                    auto drawSprite =
-                        reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
-                    drawSprite(batch, s_toolSheet, dxy, dwh, &src, 0xFFFFFFFFu,
-                               0.0f, 0.0f, 0.0f, 1.0f, 0);
-                    drew = 1;
-                }
-                if (drew == 0 && kHud_tool.count > 0) {
-                    void* white =
-                        *reinterpret_cast<void**>(g_base + kStaminaRectOff);
-                    if (Plausible(white)) {
-                        DrawIconRuns(white, kHud_tool.runs, kHud_tool.count,
-                                     kHudToolX, kHudToolY, kHudToolScale);
-                    }
-                }
-                auto drawString = reinterpret_cast<DrawStringFn>(
-                    g_base + kDrawStringOff);
-                drawString(batch, font, s_upgradeLine.obj, 0xFFFFFFFFu,
-                           kHudTextX, kHudToolTextY);
+        if (drew == 0 && kHud_tool.count > 0) {
+            void* white = *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+            if (Plausible(white)) {
+                DrawIconRuns(white, kHud_tool.runs, kHud_tool.count,
+                             kHudToolX, kHudToolY, kHudToolScale);
             }
         }
+        DrawHudString(s_upgradeLine.obj, kHudTextX, kHudToolTextY, 0xFFFFFFFFu);
     }
 
     void HookDrawHud(void* self) {
