@@ -316,6 +316,10 @@ namespace {
     constexpr unsigned  kFarmerToolUpgradeDaysOff = 0x5B8u;
     /* Off while the feature is being proven on hardware. */
     constexpr bool kHudInfo = true;
+    /* Diagnostic: draw the raw weather id the row was built from, so a wrong
+     * forecast can be traced to the value or to the mapping.  Off for release;
+     * on for the one-off build that settles it. */
+    constexpr bool kHudRawProbe = false;
     /* Temporary: draws a grid of 16x16 tiles from the cursors sheet so the
      * weather icons can be located by eye instead of guessed from a
      * disassembly of TV.draw. */
@@ -18381,6 +18385,8 @@ namespace {
      * while the TV said rain.  Strings are immutable in .NET, so a new value
      * is always a new pointer. */
     void* s_weatherPtr = nullptr;
+    CachedStr s_rawLine{nullptr, 0, 0};
+    void* s_rawPtr = nullptr;
 
     /* Reads a managed String.  Layout from the metadata: length at +0x10, the
      * first UTF-16 character at +0x14. */
@@ -18643,6 +18649,27 @@ namespace {
             CachedStrBuild(&s_weatherLine, buf, n);
         }
 
+        if (kHudRawProbe &&
+            (weather != s_rawPtr || !CachedStrOk(s_rawLine))) {
+            s_rawPtr = weather;
+            char16_t buf[48];
+            int n = 0;
+            const char16_t pre[] = u"raw:";
+            for (int i = 0; pre[i] != 0 && n < 8; i++) {
+                buf[n++] = pre[i];
+            }
+            int rawLen = 0;
+            const char16_t* raw = StrChars(weather, &rawLen);
+            for (int i = 0; raw != nullptr && i < rawLen && n < 24; i++) {
+                buf[n++] = raw[i];
+            }
+            buf[n++] = u' ';
+            buf[n++] = u'd';
+            n = AppendUnsigned(buf, n, day);
+            buf[n] = 0;
+            CachedStrBuild(&s_rawLine, buf, n);
+        }
+
         /* Daily luck.  s_luckHundredths is sampled once a second in update. */
         if (s_luckHundredths != s_luckShown || !CachedStrOk(s_luckLine)) {
             s_luckShown = s_luckHundredths;
@@ -18757,6 +18784,10 @@ namespace {
                            LuckColour(s_luckHundredths), 0.0f, 0.0f, 0.0f,
                            1.0f, 0);
             }
+        }
+
+        if (kHudRawProbe) {
+            DrawHudString(s_rawLine.obj, kHudTextX, 232.0f, 0xFFFFFF00u);
         }
 
         /* Tool upgrade countdown: only when something is actually upgrading. */
