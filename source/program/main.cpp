@@ -305,7 +305,13 @@ namespace {
      * so passing null is the shape the game itself uses. */
     constexpr uintptr_t kStringCtorCharsOff  = SDV_OFF(kStringCtorCharsOff, 0x137D0u);
     constexpr uintptr_t kGame1SpriteBatchOff = SDV_OFF(kGame1SpriteBatchOff, 0xC95BA88u);
-    constexpr uintptr_t kWeatherTomorrowOff  = SDV_OFF(kWeatherTomorrowOff, 0xC95BE18u);
+    /* Game1.weatherForTomorrow is a static string, and this build reaches it
+     * through a cached pointer: [0xBBCAF28] -> slot -> Il2CppString*.
+     * ApplyWeatherForNewDay writes it with `ldr x8,[x8,#0xf28]; str x0,[x8]`,
+     * i.e. two hops.  Reading 0xC95BE18 directly gave a string that said "Sun"
+     * while the TV said rain -- a different static, not this one. */
+    constexpr uintptr_t kWeatherTomorrowSlotOff =
+        SDV_OFF(kWeatherTomorrowSlotOff, 0xBBCAF28u);
     /* Farmer.daysLeftForToolUpgrade is a NetInt at +0x5B8. */
     constexpr unsigned  kFarmerToolUpgradeDaysOff = 0x5B8u;
     /* Off while the feature is being proven on hardware. */
@@ -18562,13 +18568,24 @@ namespace {
      * it changes, so it looked like a random freeze rather than a repeatable
      * one.  Same rule as v392: managed calls live in update, draw only reads.
      */
+    /* Two hops: the cached slot pointer, then the string itself.  Either hop
+     * can be null early in a load, so both are checked. */
+    void* WeatherTomorrow() {
+        void** slot =
+            *reinterpret_cast<void***>(g_base + kWeatherTomorrowSlotOff);
+        if (slot == nullptr || !Plausible(slot)) {
+            return nullptr;
+        }
+        return *slot;
+    }
+
     void BuildHudStrings() {
         if (!kHudInfo) {
             return;
         }
 
         /* Tomorrow's weather.  Rebuilt only when the calendar day changes. */
-        void* weather = *reinterpret_cast<void**>(g_base + kWeatherTomorrowOff);
+        void* weather = WeatherTomorrow();
         const int season = *reinterpret_cast<const int*>(g_base + kSeasonOff);
         const int day = *reinterpret_cast<const int*>(g_base + kDayOfMonthOff);
         const int key = season * 100 + day;
@@ -18679,8 +18696,7 @@ namespace {
             /* Our own art, encoded as filled rectangles: no texture to load.
              * The slot is null until that icon has been drawn, so a missing
              * icon simply shows the text alone instead of drawing garbage. */
-            void* weather =
-                *reinterpret_cast<void**>(g_base + kWeatherTomorrowOff);
+            void* weather = WeatherTomorrow();
             const int idx = WeatherIconIndex(weather);
             if (idx >= 0 && idx < kWeatherIconCount &&
                 kWeatherIcons[idx].count > 0) {
