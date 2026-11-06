@@ -1,0 +1,23 @@
+Stardew Valley (Switch) native mod -- package manifest
+
+版本          v1.0
+构建          v417-16ae57f2
+打包时间      2026-11-06 16:32
+
+subsdk8       md5 16ae57f2fde939531911d18ce4fa9ac1
+              151416 字节
+main.npdm     md5 6f281d0b48f69eb26fdebb1ffd265ef6
+              1516 字节
+sdv_items.ovl md5 e3ce8956ed87f1045fa5ebe74f514d59
+              593976 字节
+cheats .txt   md5 bab8cdac4ea07347fe08a9a5d03376b9
+              541 字节
+horse.xnb     md5 4b8612f33b2eced80d62d3f186b6f88e
+              229461 字节（可选外观，删掉就是原版马）
+
+适用游戏      Stardew Valley 1.6.15.13 (Switch)
+Title ID      0100E65002BB8000
+Build ID      E7F845093E8CBC68DACF011CCB620D6667B5A20B
+
+版本不对时：mod 会自己禁用（不崩、不坏档，但功能全无），
+插件会提示「游戏版本不匹配，未写入」并一个字节都不写。

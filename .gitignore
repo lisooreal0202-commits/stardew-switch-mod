@@ -1,0 +1,14 @@
+build/
+*.elf
+*.nso
+*.npdm
+!atmosphere/**/main.npdm
+*.bak
+*.o
+*.d
+__pycache__/
+# The release-page asset is built from this tree, not committed into it.
+*.zip
+# The optional tractor appearance is shipped in the zip but never committed:
+# half of that sheet is retail art and it must not enter the history.
+atmosphere/contents/*/romfs/
