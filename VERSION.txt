@@ -1,11 +1,11 @@
 Stardew Valley (Switch) native mod -- package manifest
 
 版本          v1.0
-构建          v423-213e2d6a
-打包时间      2026-11-06 21:32
+构建          v424-c3d22ea9
+打包时间      2026-11-06 21:37
 
-subsdk8       md5 e9453ce991f502072bfb4beb3130104d
-              151005 字节
+subsdk8       md5 cfa3009b3de176554f346702a25a49c2
+              151133 字节
 main.npdm     md5 6f281d0b48f69eb26fdebb1ffd265ef6
               1516 字节
 sdv_items.ovl md5 e3ce8956ed87f1045fa5ebe74f514d59

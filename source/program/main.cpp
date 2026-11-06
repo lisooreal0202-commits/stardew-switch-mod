@@ -18624,6 +18624,16 @@ namespace {
                     label = name;
                 }
             }
+            /* The TV does not show the raw field during the first days of a
+             * save: it runs getWeatherModificationsForDate first, which forces
+             * the tutorial weather (DaysPlayed + 1 <= 4 -> Sun, == 3 -> Rain).
+             * A save can only start in Spring of year 1, so season 0 with
+             * day <= 3 is exactly that window -- the field itself still holds
+             * the current day's weather there, which is what made the row look
+             * one day behind on a new save. */
+            if (season == 0 && day >= 1 && day <= 3) {
+                label = (day == 2) ? u"雨" : u"晴";
+            }
             char16_t buf[32];
             int n = 0;
             const char16_t pre[] = u"明日 ";
