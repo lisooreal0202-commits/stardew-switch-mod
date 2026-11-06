@@ -18374,6 +18374,13 @@ namespace {
     CachedStr s_weatherLine{nullptr, 0, 0};
     CachedStr s_luckLine{nullptr, 0, 0};
     int   s_weatherKey = -1;
+    /* The string object we last built the weather line from.  The calendar key
+     * alone is not enough: at load Game1.weatherForTomorrow still holds its
+     * default "Sun" until the day is applied, so the first frame built "明日
+     * 晴" and the key never changed again -- the row kept showing the default
+     * while the TV said rain.  Strings are immutable in .NET, so a new value
+     * is always a new pointer. */
+    void* s_weatherPtr = nullptr;
 
     /* Reads a managed String.  Layout from the metadata: length at +0x10, the
      * first UTF-16 character at +0x14. */
@@ -18589,8 +18596,10 @@ namespace {
         const int season = *reinterpret_cast<const int*>(g_base + kSeasonOff);
         const int day = *reinterpret_cast<const int*>(g_base + kDayOfMonthOff);
         const int key = season * 100 + day;
-        if (key != s_weatherKey || !CachedStrOk(s_weatherLine)) {
+        if (key != s_weatherKey || weather != s_weatherPtr ||
+            !CachedStrOk(s_weatherLine)) {
             s_weatherKey = key;
+            s_weatherPtr = weather;
             const char16_t* label = WeatherLabel(weather);
             /* A festival day arrives as the weather id "Festival", which is
              * useless on its own -- the calendar knows which one it is, so
