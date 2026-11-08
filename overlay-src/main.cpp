@@ -1686,46 +1686,12 @@ u64  gSubsdkBase  = 0;
 u64  gTimeReqSlot = 0;
 char gTimeReqStatus[64] = "未测试";
 
-u64 findSubsdkBase() {
-    if (gSubsdkBase) return gSubsdkBase;
-    u64 total = 0;
-    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return 0;
-    MemoryInfo chunk[32];
-    u64 off = 0;
-    while (off < total) {
-        u64 got = 0;
-        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
-            break;
-        for (u64 i = 0; i < got; i++) {
-            const MemoryInfo& m = chunk[i];
-            if (!(m.perm & Perm_X)) continue;
-            u32 head[3] = {};
-            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr, head, sizeof(head))))
-                continue;
-            if (head[0] != kNxBranch) continue;
-            // The two words after the branch are the offsets of __nx_mod0 and
-            // __nx_modver.  They always sit 0x1C apart, and MOD0 sits at the
-            // first one -- which is in .rodata, so it is outside this mapping.
-            if (head[2] != head[1] + 0x1Cu) continue;
-            if (head[1] < 0x1000u || head[1] > 0x1000000u) continue;
-            u8 tag[4] = {};
-            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + head[1], tag, 4)))
-                continue;
-            if (tag[0] != 'M' || tag[1] != 'O' || tag[2] != 'D' || tag[3] != '0')
-                continue;
-            gSubsdkBase = m.addr;
-            return gSubsdkBase;
-        }
-        off += got;
-    }
-    return 0;
-}
-
-// The request struct lives in the module's writable segment, which is inside
-// the module image.  Scanning that instead of computing an offset is what makes
-// this independent of how the mod was built.
-u64 findTimeRequestSlot(u64 base) {
-    if (gTimeReqSlot) return gTimeReqSlot;
+// The module's writable segment, scanned for the marker.  Windowed to the
+// first 2 MB of the module on purpose: the game's own main module passes the
+// header test below too (it is an NSO with a MOD0 header as well), but its data
+// segment sits ~190 MB into its image, so it falls outside this window and the
+// candidate is rejected in a few reads instead of a 15 MB scan.
+u64 scanSlotIn(u64 base) {
     u64 total = 0;
     if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return 0;
     static u8 buf[0x8000 + 16];
@@ -1749,8 +1715,7 @@ u64 findTimeRequestSlot(u64 base) {
                     continue;
                 for (u64 k = 0; k + 16 <= rd; k += 4) {
                     if (std::memcmp(buf + k, kSlotMagic, 16) == 0) {
-                        gTimeReqSlot = m.addr + p + k;
-                        return gTimeReqSlot;
+                        return m.addr + p + k;
                     }
                 }
             }
@@ -1760,18 +1725,53 @@ u64 findTimeRequestSlot(u64 base) {
     return 0;
 }
 
+// The header test alone is not enough to identify the mod -- see above -- so a
+// candidate only counts once the marker turns up inside it.
+bool findSubsdk() {
+    if (gSubsdkBase && gTimeReqSlot) return true;
+    u64 total = 0;
+    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return false;
+    MemoryInfo chunk[32];
+    u64 off = 0;
+    while (off < total) {
+        u64 got = 0;
+        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
+            break;
+        for (u64 i = 0; i < got; i++) {
+            const MemoryInfo& m = chunk[i];
+            if (!(m.perm & Perm_X)) continue;
+            u32 head[3] = {};
+            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr, head, sizeof(head))))
+                continue;
+            if (head[0] != kNxBranch) continue;
+            // The two words after the branch are the offsets of __nx_mod0 and
+            // __nx_modver.  They always sit 0x1C apart, and MOD0 sits at the
+            // first one -- which is in .rodata, so it is outside this mapping.
+            if (head[2] != head[1] + 0x1Cu) continue;
+            if (head[1] < 0x1000u || head[1] > 0x1000000u) continue;
+            u8 tag[4] = {};
+            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + head[1], tag, 4)))
+                continue;
+            if (tag[0] != 'M' || tag[1] != 'O' || tag[2] != 'D' || tag[3] != '0')
+                continue;
+            const u64 slot = scanSlotIn(m.addr);
+            if (!slot) continue;
+            gSubsdkBase  = m.addr;
+            gTimeReqSlot = slot;
+            return true;
+        }
+        off += got;
+    }
+    return false;
+}
+
 // Odd/even seqlock: odd seq means "being written", even means "published".
 bool submitTimeRequest(int hhmm) {
-    const u64 base = findSubsdkBase();
-    if (!base) {
+    if (!findSubsdk()) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到 subsdk8");
         return false;
     }
-    const u64 slot = findTimeRequestSlot(base);
-    if (!slot) {
-        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到请求槽");
-        return false;
-    }
+    const u64 slot = gTimeReqSlot;
 
     const u64 addr = slot + kSlotSeqOff;
     u32 seq = 0;
