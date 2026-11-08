@@ -1662,30 +1662,30 @@ bool poke(u64 off, const void* data, size_t size) {
 
 // ---------------------------------------------------------------- subsdk8 ---
 //
-// Communication test only: publish a request into the mod's own slot and let
-// the mod read it.  Nothing here touches timeOfDay, the clock or the date.
+// Publishes a set-time request into the mod's own slot.  Nothing here touches
+// timeOfDay or the date: the mod reads the request on its update thread.
 //
-// The slot's address was taken from the built module:
-//   aarch64-none-elf-nm -S sdv_native.elf | grep g_timeRequest
-//   000000000003d310 0000000000000008 d g_timeRequest
-// The three NSO segments match the ELF program headers one for one, so the
-// runtime address is module base + 0x3D310.  Re-export if the mod is rebuilt.
+// The slot is found by content, not by address.  This block used to carry the
+// module's text fingerprint and the slot offset, both read out of the ELF by
+// hand -- and both move on every rebuild, so a dev build and a release build
+// needed two different overlays, and a stale number only showed up as "找不到
+// subsdk8" with no clue which half was wrong.
+//
+// Now: find the module by its NX header, then scan its writable segment for the
+// marker at the front of the request struct.  One .ovl works with every build.
 
-constexpr u64 kSubsdkTimeReqOff = 0x3D310ULL;
-// First eight bytes of the mod's text: the branch over the NX header, then
-// __nx_mod0's offset (0x36BA0) and __nx_modver's (0x36BBC).  Both offsets move
-// whenever the module's text changes size, so this has to be re-read from the
-// ELF for every build -- it read 0x38C50 in the previous one, which made the
-// scan fail with "找不到 subsdk8" instead of finding the wrong module.
-//   xxd -l 16 sdv_native.elf at the first LOAD's file offset
-constexpr u8  kSubsdkSig[8] = {0x08, 0x00, 0x00, 0x14, 0xA0, 0x6B, 0x03, 0x00};
+constexpr u8 kSlotMagic[16] = {
+    'S', 'D', 'V', '-', 'S', 'E', 'T', 'T', 'I', 'M', 'E', '-', '0', '1', 0, 0
+};
+// `b #0x20` -- the branch every exlaunch module starts with, over its header.
+constexpr u32 kNxBranch = 0x14000008u;
+// Offset of seq inside the request struct: the 16 marker bytes, then seq.
+constexpr u64 kSlotSeqOff = 16;
 
-u64  gSubsdkBase = 0;
+u64  gSubsdkBase  = 0;
+u64  gTimeReqSlot = 0;
 char gTimeReqStatus[64] = "未测试";
 
-// Scans the mappings for an executable region whose first bytes match the
-// mod's text.  No module list is available through this dmnt struct, so the
-// signature is what identifies the module.
 u64 findSubsdkBase() {
     if (gSubsdkBase) return gSubsdkBase;
     u64 total = 0;
@@ -1699,13 +1699,61 @@ u64 findSubsdkBase() {
         for (u64 i = 0; i < got; i++) {
             const MemoryInfo& m = chunk[i];
             if (!(m.perm & Perm_X)) continue;
-            u8 head[8];
+            u32 head[3] = {};
             if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr, head, sizeof(head))))
                 continue;
-            bool same = true;
-            for (int k = 0; k < 8; k++)
-                if (head[k] != kSubsdkSig[k]) { same = false; break; }
-            if (same) { gSubsdkBase = m.addr; return gSubsdkBase; }
+            if (head[0] != kNxBranch) continue;
+            // The two words after the branch are the offsets of __nx_mod0 and
+            // __nx_modver.  They always sit 0x1C apart, and MOD0 sits at the
+            // first one -- which is in .rodata, so it is outside this mapping.
+            if (head[2] != head[1] + 0x1Cu) continue;
+            if (head[1] < 0x1000u || head[1] > 0x1000000u) continue;
+            u8 tag[4] = {};
+            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + head[1], tag, 4)))
+                continue;
+            if (tag[0] != 'M' || tag[1] != 'O' || tag[2] != 'D' || tag[3] != '0')
+                continue;
+            gSubsdkBase = m.addr;
+            return gSubsdkBase;
+        }
+        off += got;
+    }
+    return 0;
+}
+
+// The request struct lives in the module's writable segment, which is inside
+// the module image.  Scanning that instead of computing an offset is what makes
+// this independent of how the mod was built.
+u64 findTimeRequestSlot(u64 base) {
+    if (gTimeReqSlot) return gTimeReqSlot;
+    u64 total = 0;
+    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return 0;
+    static u8 buf[0x8000 + 16];
+    MemoryInfo chunk[32];
+    u64 off = 0;
+    while (off < total) {
+        u64 got = 0;
+        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
+            break;
+        for (u64 i = 0; i < got; i++) {
+            const MemoryInfo& m = chunk[i];
+            if (!(m.perm & Perm_W)) continue;
+            if (m.addr < base || m.addr >= base + 0x200000ull) continue;
+            for (u64 p = 0; p < m.size; p += 0x8000) {
+                u64 n = m.size - p;
+                if (n > 0x8000) n = 0x8000;
+                u64 rd = n + 16;
+                if (p + rd > m.size) rd = m.size - p;
+                if (rd < 16) break;
+                if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr + p, buf, rd)))
+                    continue;
+                for (u64 k = 0; k + 16 <= rd; k += 4) {
+                    if (std::memcmp(buf + k, kSlotMagic, 16) == 0) {
+                        gTimeReqSlot = m.addr + p + k;
+                        return gTimeReqSlot;
+                    }
+                }
+            }
         }
         off += got;
     }
@@ -1715,9 +1763,17 @@ u64 findSubsdkBase() {
 // Odd/even seqlock: odd seq means "being written", even means "published".
 bool submitTimeRequest(int hhmm) {
     const u64 base = findSubsdkBase();
-    if (!base) { std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到 subsdk8"); return false; }
+    if (!base) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到 subsdk8");
+        return false;
+    }
+    const u64 slot = findTimeRequestSlot(base);
+    if (!slot) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到请求槽");
+        return false;
+    }
 
-    const u64 addr = base + kSubsdkTimeReqOff;
+    const u64 addr = slot + kSlotSeqOff;
     u32 seq = 0;
     if (R_FAILED(dmntchtReadCheatProcessMemory(addr, &seq, sizeof(seq)))) {
         std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读 seq 失败");

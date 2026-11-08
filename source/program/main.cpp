@@ -65,9 +65,9 @@ static const bool kDiagNoHooks = false;
 
 /* Set-time request slot.  The Tesla overlay writes it through dmnt; the update
  * hook will read it once the trigger path is agreed.  Nothing reads it today.
- * `used` keeps it alive through --gc-sections so the address the overlay needs
- * stays fixed; it lives in .bss, which is writable in the loaded module. */
-__attribute__((used)) settime::Request g_timeRequest{0u, 600};
+ * `used` keeps it alive through --gc-sections.  The overlay finds it by the
+ * magic bytes at the front, not by address -- see settime::Request. */
+__attribute__((used)) settime::Request g_timeRequest{"SDV-SETTIME-01", 0u, 600};
 
 namespace {
 

@@ -71,6 +71,21 @@ inline bool IsValidTarget(int hhmm) {
  * ------------------------------------------------------------------------- */
 
 struct Request {
+    /* Fixed marker, and the first thing in the struct on purpose.
+     *
+     * The overlay has no symbol table, so it used to carry two numbers baked in
+     * at build time: the module's text fingerprint and the offset of this
+     * struct.  Both move on every rebuild -- the fingerprint is the offset of
+     * __nx_mod0, which sits in .rodata and shifts whenever the text grows --
+     * so a dev build and a release build needed two different overlays, and
+     * forgetting to re-sync showed up as "找不到 subsdk8" with no clue why.
+     *
+     * Now the overlay scans the module's writable segment for these 16 bytes
+     * and takes what follows as seq/target.  Nothing about the address is
+     * baked into the overlay, so one .ovl works with every build.  Changing the
+     * contents of the marker would break that, which is why it ends in a
+     * version suffix. */
+    char magic[16];
     /* Bumped by the writer.  Odd means "being written", even means "stable". */
     volatile uint32_t seq;
     /* HHMM the player picked.  Only meaningful when seq is even and stable. */
