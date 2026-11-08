@@ -28,15 +28,20 @@
 //   * the process needs an npdm that grants svcMapProcessMemory, which the
 //     game's own npdm does not
 
+#include <cstdio>
+
 #include "lib.hpp"
 #include "lib/nx/kernel/svc.h"
 #include "lib/nx/result.h"
 #include "lib/util/sys/rw_pages.hpp"
 #include "program/birthday_table.hpp"
+#include "program/npc_names_cn.hpp"
 #include "program/npc_crop_table.hpp"
 #include "program/worldmap_table.hpp"
 #include "program/tooltip_rect_table.hpp"
 #include "program/weather_icons.hpp"
+#include "program/leo_head.hpp"
+#include "program/set_time.hpp"
 
 #include "program/sdlog.hpp"
 #include "program/offset_tables.hpp"
@@ -57,6 +62,12 @@
  * "a hook did it" from "a code patch did it". */
 static const bool kDiagNoHooks = false;
 #define HOOKF(...) (kDiagNoHooks ? nullptr : exl::hook::Hook(__VA_ARGS__))
+
+/* Set-time request slot.  The Tesla overlay writes it through dmnt; the update
+ * hook will read it once the trigger path is agreed.  Nothing reads it today.
+ * `used` keeps it alive through --gc-sections so the address the overlay needs
+ * stays fixed; it lives in .bss, which is writable in the loaded module. */
+__attribute__((used)) settime::Request g_timeRequest{0u, 600};
 
 namespace {
 
@@ -312,18 +323,96 @@ namespace {
      * while the TV said rain -- a different static, not this one. */
     constexpr uintptr_t kWeatherTomorrowSlotOff =
         SDV_OFF(kWeatherTomorrowSlotOff, 0xBBCAF28u);
+    /* Utility.isGreenRainDay(int day, Season season) and
+     * Utility.isFestivalDay(int day, Season season).  Both are called from
+     * getWeatherModificationsForDate @0x1470B38 / @0x1470BB4 with w0 = day and
+     * w1 = season; the AOT entry points take a third MethodInfo* that the game
+     * leaves alone here, so it is passed as null.  0x1B7D8A0 is a thunk that
+     * zeroes that argument itself and tail-calls the real body. */
+    constexpr uintptr_t kIsGreenRainDayOff =
+        SDV_OFF(kIsGreenRainDayOff, 0x1B98500u);
+    constexpr uintptr_t kIsFestivalDayOff =
+        SDV_OFF(kIsFestivalDayOff, 0x1B7D8A0u);
+    /* The calls the TV itself makes (TV.getWeatherForecast @0x1A4A5B0), in the
+     * order it makes them.  All verified from that call site. */
+    constexpr uintptr_t kGetDateOff =
+        SDV_OFF(kGetDateOff, 0x1443580u);
+    constexpr uintptr_t kWorldDateCopyCtorOff =
+        SDV_OFF(kWorldDateCopyCtorOff, 0x1BB71D0u);   /* (this, WorldDate*) */
+    constexpr uintptr_t kGetTotalDaysOff =
+        SDV_OFF(kGetTotalDaysOff, 0x1BB76B0u);
+    constexpr uintptr_t kSetTotalDaysOff =
+        SDV_OFF(kSetTotalDaysOff, 0x1BB7700u);        /* (WorldDate*, int) */
+    constexpr uintptr_t kGetWeatherModsOff =
+        SDV_OFF(kGetWeatherModsOff, 0x1470A40u);      /* (WorldDate*, str) */
+    /* The slot TV reads for the base weather: ldr x1,[0xC95BE18].  This is a
+     * plain static, one hop, unlike 0xBBCAF28 which is a pointer to the
+     * field. */
+    constexpr uintptr_t kWeatherTvSlotOff =
+        SDV_OFF(kWeatherTvSlotOff, 0xC95BE18u);
+    /* The three statics Game1.get_Date feeds into WorldDate..ctor.  Order is
+     * the constructor's argument order -- not yet confirmed on hardware. */
+    constexpr uintptr_t kStaticDateAOff =
+        SDV_OFF(kStaticDateAOff, 0xBBBD680u);
+    constexpr uintptr_t kStaticDateBOff =
+        SDV_OFF(kStaticDateBOff, 0xBBBD668u);
+    constexpr uintptr_t kStaticDateCOff =
+        SDV_OFF(kStaticDateCOff, 0xBBBB290u);
+    /* Plain static ints next to currentSeason (0xC95BE28).  These are NOT the
+     * NetInt the slot points at -- they are a second copy, read directly by 24
+     * and 26 sites.  0xC95BEB0 is the address the Tesla plugin has been writing.
+     * Read-only probe: see PollDateIdentity(). */
+    constexpr uintptr_t kStaticDayCopyOff =
+        SDV_OFF(kStaticDayCopyOff, 0xC95BEB0u);
+    constexpr uintptr_t kStaticYearCopyOff =
+        SDV_OFF(kStaticYearCopyOff, 0xC95BEB4u);
+    /* Frames the weather slot must stay unchanged after a date change before
+     * the result may be cached.  Measured on hardware: 5 frames on a normal
+     * day change (f24874 date -> f24879 weather) and 20 frames on a save load
+     * (f7381 -> f7401).  60 leaves margin for both. */
+    constexpr int kWeatherStableFrames = 60;
+    /* Game1.Date is a NetRef<WorldDate> behind a slot pointer, and
+     * WorldDate.get_TotalDays is the day counter the game itself uses.
+     * The two static ints above lag -- observed stuck at d1 on day 2 and at d5
+     * on day 6 -- and since the HUD keys its rebuild on season*100+day, that
+     * froze the weather text while the icon (drawn live) kept up. */
+    /* Game1.Date, verified from get_Date @0x1443580:
+     *     adrp x8,#0xc95c000 / add #0x260 / ldr x8,[x8] / ldr x0,[x8,#0x68]
+     * so: *(0xC95C260) is the NetRef, and its Value at +0x68 is the WorldDate.
+     *
+     * WorldDate fields, verified from get_DayOfMonth @0x1BB7350 and
+     * get_TotalDays @0x1BB76B0 -- all three are NetInt wrappers whose value
+     * sits at +0x68:
+     *     +0x10 Year   +0x18 Season   +0x20 DayOfMonth
+     *     TotalDays = (Season + 4*Year) * 28 + DayOfMonth - 113
+     * Every read below is a plain load; no managed call is involved. */
+    constexpr uintptr_t kGame1DateSlotOff =
+        SDV_OFF(kGame1DateSlotOff, 0xC95C260u);
+    constexpr uintptr_t kWorldDateYearOff     = 0x10u;
+    constexpr uintptr_t kWorldDateSeasonOff   = 0x18u;
+    constexpr uintptr_t kWorldDateDayOff      = 0x20u;
     /* Farmer.daysLeftForToolUpgrade is a NetInt at +0x5B8. */
     constexpr unsigned  kFarmerToolUpgradeDaysOff = 0x5B8u;
     /* Off while the feature is being proven on hardware. */
     constexpr bool kHudInfo = true;
     /* Diagnostic: draw the raw weather id the row was built from, so a wrong
-     * forecast can be traced to the value or to the mapping.  Off for release;
-     * on for the one-off build that settles it. */
+     * forecast can be traced to the value or to the mapping.  Off in the public
+     * build -- ten lines of numbers over the map is a debugging aid, not a
+     * feature.  Compile-time, so the readouts and the counters behind them are
+     * removed from the binary rather than left as dead draws. */
+#ifdef SDV_RELEASE
     constexpr bool kHudRawProbe = false;
-    /* Temporary: draws a grid of 16x16 tiles from the cursors sheet so the
-     * weather icons can be located by eye instead of guessed from a
-     * disassembly of TV.draw. */
-    constexpr bool kIconProbe = true;
+#else
+    constexpr bool kHudRawProbe = true;
+#endif
+    /* The phase-3 weather chain allocates two managed objects per run.  It is
+     * kept separate from the read-only probes so a diagnostic build can show
+     * fields without paying that cost -- that allocation is what crashed on a
+     * location load once already. */
+    constexpr bool kDeepWeatherProbe = false;
+    /* Round 6: actually apply a published request.  Off only to get a build
+     * that keeps the readout but cannot move the clock. */
+    constexpr bool kTimeExec = true;
 
     /* HUD layout.  The icon is 32x32 art drawn at an integer scale so the
      * rectangles stay on whole pixels -- 1.5x would put every run on a half
@@ -351,22 +440,35 @@ namespace {
     constexpr int kHudIconScale = 2;
     constexpr float kHudTextY = kHudRowY + 20.0f;   /* 40 */
 
+    /* Two columns, two rows.  A single stack of four rows reached y=300 and
+     * left the right half of the screen empty; 2x2 ends at y=164 and uses
+     * 600px of width instead.
+     *
+     *   col 0 x=24  (icon centre 56)   col 1 x=264 (icon centre 296)
+     *   row 0 y=20   weather           luck
+     *   row 1 y=100  birthday          tool upgrade
+     */
+    constexpr int kHudCol1X = 264;
+    constexpr int kHudRow1Y = 100;
+
     /* Daily luck.  The icon is Cursors (50,428,10,14) -- the exact region UI
      * Info Suite 2 uses for it -- drawn at 4x, also like the original.  It is
      * tinted by luck tier, so the colour alone tells you the answer. */
-    constexpr int kHudLuckX = kHudIconCx - 20;      /* 36, art is 40 wide */
-    constexpr int kHudLuckY = kHudRowY + kHudRowPitch + (kHudBand - 56) / 2;
+    constexpr int kHudLuckX = kHudCol1X + 12;       /* 276, art is 40 wide */
+    constexpr int kHudLuckY = kHudRowY + (kHudBand - 56) / 2;   /* 24 */
     constexpr int kHudLuckScale = 4;
-    constexpr float kHudLuckTextY = kHudLuckY + 16.0f;   /* 112 */
+    /* Transparent rows under the die art, times the scale.  See the draw. */
+    constexpr int kHudLuckArtDy = 12;
+    constexpr float kHudLuckTextY = kHudRowY + 20.0f;    /* 40 */
 
     /* Tool upgrade.  The icon is the tool's own sprite, taken from the game's
      * tool sheet -- that is what UI Info Suite 2 does, and what the player
      * expects (a copper axe while the axe is in the shop).  Our own hammer is
      * only the fallback for when the tool cannot be read. */
-    constexpr int kHudToolX = kHudIconCx - 32;      /* 24, art is 64 wide */
-    constexpr int kHudToolY = kHudRowY + 2 * kHudRowPitch;   /* 164 */
+    constexpr int kHudToolX = kHudIconX;            /* 24, art is 64 wide */
+    constexpr int kHudToolY = kHudRow1Y;            /* 100 */
     constexpr int kHudToolScale = 2;
-    constexpr float kHudToolTextY = kHudToolY + 20.0f;   /* 184 */
+    constexpr float kHudToolTextY = kHudRow1Y + 20.0f;   /* 120 */
 
     /* Farmer.toolBeingUpgraded (NetRef<Tool>) -> Tool.indexOfMenuItemView
      * (NetInt) -> Game1.getSquareSourceRectForNonStandardTileSheet(sheet, 16,
@@ -540,9 +642,6 @@ namespace {
      * against the expected anchors, then set these to the residual. */
     /* Birthday toast state.  Namespace scope so both the map-page readout and
      * HookDrawHud (defined later in this file) can reach it. */
-    static unsigned g_hudState = 0;
-    static unsigned g_hudChars = 0;
-    static int g_bdayNotified = -1;
     /* FastAnimations slice 1: extra advances issued this frame / total. */
     static unsigned g_animExtra = 0;
     static unsigned g_animTotal = 0;
@@ -2927,6 +3026,12 @@ namespace {
         static float s_avX[kMaxAvatarRecords];
         static float s_avY[kMaxAvatarRecords];
         static int s_avCount = 0;
+        /* Names already placed on the map this pass.  The same villager can
+         * exist as two separate objects (Mr Qi does), so pointer identity is
+         * not enough -- the name is what the player sees. */
+        static constexpr int kMaxSeenNames = 96;
+        static char s_seenNames[kMaxSeenNames][16];
+        static int s_seenNameCount = 0;
         s_origDrawMini(self, batch, alpha);
         if (kDiagNoDraw) {
             return;
@@ -3429,6 +3534,7 @@ namespace {
          *            never does.  Row 6 byte 1 is questDailyMask now. */
         if (kMapStage >= kStageAvatar) {
             s_avCount = 0;
+            s_seenNameCount = 0;
             auto readableRange = [](const void* p, size_t bytes) -> bool {
                 const uintptr_t a = reinterpret_cast<uintptr_t>(p);
                 if (a < 0x10000u || bytes == 0 || a + bytes < a) {
@@ -5276,6 +5382,38 @@ namespace {
                              * other and their heads land on top of one
                              * another.  Drawing is deferred to a second pass
                              * that spreads them first. */
+                            /* The same character object can sit in more than
+                             * one location's list (Mr Qi is the one seen on
+                             * hardware: two identical heads on the map).  A
+                             * marker is per character, not per list entry, so
+                             * skip anything already collected this pass. */
+                            int dup = 0;
+                            for (int q = 0; q < s_avCount; q++) {
+                                if (s_avNpcPtr[q] == npc) {
+                                    dup = 1;
+                                    break;
+                                }
+                            }
+                            if (dup == 0 && nm[0] != '\0') {
+                                for (int q = 0; q < s_seenNameCount; q++) {
+                                    if (std::strcmp(s_seenNames[q], nm) == 0) {
+                                        dup = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (dup != 0) {
+                                continue;
+                            }
+                            if (nm[0] != '\0' && s_seenNameCount < kMaxSeenNames) {
+                                int q = 0;
+                                for (; q < 15 && nm[q] != '\0'; q++) {
+                                    s_seenNames[s_seenNameCount][q] = nm[q];
+                                }
+                                s_seenNames[s_seenNameCount][q] = '\0';
+                                ++s_seenNameCount;
+                            }
+
                             if (markerCount < kMaxMarkers) {
                                 Marker& m = markers[markerCount++];
 
@@ -5308,6 +5446,10 @@ namespace {
                                 if (season >= 0 && cursors != nullptr &&
                                     npcbday::Lookup(nm, &bs, &bd) &&
                                     bs == season && bd == dayOfMonth) {
+                                    /* Still counted (it is the canary that
+                                     * says the calendar reads work) but no
+                                     * longer drawn: the birthday moved to the
+                                     * HUD row, one place instead of two. */
                                     m.bday = 1;
                                     s_bdayDay = dayOfMonth;
                                     bdayCount++;
@@ -5436,39 +5578,6 @@ namespace {
                             static_cast<u32>(kAvatarW);
                         drawSprite(batch, markers[i].sheet, dxy, dwh, &src,
                                    0xFFFFFFFFu, 0.0f, 0.0f, 0.0f, 1.0f, 0);
-
-                        /* Birthday badge, pinned to the head's top-right
-                         * corner and allowed to overhang it by 2px -- the same
-                         * relationship NPC Map Locations uses between its
-                         * portrait rect and the icon.  Drawn after the head so
-                         * it is never buried by a neighbour's face. */
-                        if (markers[i].bday != 0) {
-                            NullableRect bs;
-                            bs.x = kBadgeSrcX;
-                            bs.y = kBadgeSrcY;
-                            bs.w = kBadgeSrcW;
-                            bs.h = kBadgeSrcH;
-                            bs.present = 1;
-                            for (int q = 0; q < 7; q++) {
-                                bs.pad[q] = 0;
-                            }
-                            const int bx = dx_i + kAvatarW - kBadgeW +
-                                kBadgeOverhang;
-                            const int by = dy_i;
-                            const u64 bdxy =
-                                (static_cast<u64>(static_cast<u32>(by)) << 32) |
-                                static_cast<u32>(bx);
-                            const u64 bdwh =
-                                (static_cast<u64>(static_cast<u32>(kBadgeH))
-                                 << 32) |
-                                static_cast<u32>(kBadgeW);
-                            /* scale stays 1.0: this helper sizes by the
-                             * destination rect, so passing 1.8 as well would
-                             * scale the icon twice (see the avatar draw above,
-                             * which does the same for the 16x15 source). */
-                            drawSprite(batch, cursors, bdxy, bdwh, &bs,
-                                       0xFFFFFFFFu, 0.0f, 0.0f, 0.0f, 1.0f, 0);
-                        }
 
                         /* Quest badge, on the left so it can never collide
                          * with the gift icon on the right. */
@@ -10012,146 +10121,6 @@ namespace {
         return true;
     }
 
-    /* Managed display-name string of today's birthday villager, or null. */
-    void* FindBirthdayName() {
-        const int s = *reinterpret_cast<const int*>(g_base + kSeasonOff);
-        const int d = *reinterpret_cast<const int*>(g_base + kDayOfMonthOff);
-        if (s < 0 || s > 3 || d < 1 || d > 28) {
-            return nullptr;
-        }
-        auto getLocations = reinterpret_cast<GetLocationsFn>(
-            g_base + kGetLocationsOff);
-        void* locList = getLocations();
-        void** locs = nullptr;
-        int locN = 0;
-        if (!ReadListRaw(locList, &locs, &locN)) {
-            return nullptr;
-        }
-        for (int i = 0; i < locN; i++) {
-            void* loc = locs[i];
-            if (loc == nullptr || !Plausible(loc) ||
-                !RangeReadable(loc, 0xB8u)) {
-                continue;
-            }
-            void* collection = *reinterpret_cast<void**>(
-                reinterpret_cast<unsigned char*>(loc) + 0xB0);
-            if (collection == nullptr || !Plausible(collection) ||
-                !RangeReadable(collection, 0x60u)) {
-                continue;
-            }
-            void* inner = *reinterpret_cast<void**>(
-                reinterpret_cast<unsigned char*>(collection) + 0x58);
-            void** npcs = nullptr;
-            int n = 0;
-            if (!ReadListRaw(inner, &npcs, &n)) {
-                continue;
-            }
-            for (int j = 0; j < n; j++) {
-                void* npc = npcs[j];
-                if (npc == nullptr || !Plausible(npc) ||
-                    !RangeReadable(npc, 0xC8u)) {
-                    continue;
-                }
-                void* netName = *reinterpret_cast<void**>(
-                    reinterpret_cast<unsigned char*>(npc) + 0xA8);
-                if (netName == nullptr || !Plausible(netName) ||
-                    !RangeReadable(netName, 0x70u)) {
-                    continue;
-                }
-                void* nameStr = *reinterpret_cast<void**>(
-                    reinterpret_cast<unsigned char*>(netName) + 0x68);
-                if (nameStr == nullptr) {
-                    continue;
-                }
-                char ascii[64];
-                if (!NameToAscii(nameStr, ascii, 64)) {
-                    continue;
-                }
-                int bs = 0;
-                int bd = 0;
-                if (!npcbday::Lookup(ascii, &bs, &bd) || bs != s || bd != d) {
-                    continue;
-                }
-                /* Prefer the localized display name, like the avatars do. */
-                void* display = *reinterpret_cast<void**>(
-                    reinterpret_cast<unsigned char*>(npc) + 0xC0);
-                if (display != nullptr && Plausible(display) &&
-                    RangeReadable(display, 0x18u)) {
-                    const int dl = *reinterpret_cast<int*>(
-                        reinterpret_cast<unsigned char*>(display) + 0x10);
-                    if (dl > 0 && dl < 64) {
-                        return display;
-                    }
-                }
-                return nameStr;
-            }
-        }
-        return nullptr;
-    }
-
-    /* "今天是<name>的生日", built without allocating a literal.
-     *
-     * PadLeft(int totalWidth, char paddingChar) is 0x39AF40, confirmed against
-     * a live caller at 0x15A3CEC (x0 = string, w1 = width, w2 = pad).  Padding
-     * the name out to nameLen + 6 always allocates a fresh string of exactly
-     * that length (it returns `this` only when no padding is needed, which
-     * cannot happen here).  We then overwrite its character buffer: the length
-     * field already matches and the string is not interned. */
-    void PushBirthdayToast(void* nameStr) {
-        if (nameStr == nullptr) {
-            g_hudState = 3;
-            return;
-        }
-        auto forCorner = reinterpret_cast<void* (*)(void*)>(g_base + 0x1586580);
-        auto addHud = reinterpret_cast<void (*)(void*)>(g_base + 0x144EF50);
-        const int nlen = ManagedStrLen(nameStr);
-        void* final = nameStr;
-        if (nlen > 0 && nlen <= 16) {
-            const int total = nlen + 6;
-            auto padLeft =
-                reinterpret_cast<void* (*)(void*, int, char16_t)>(
-                    g_base + 0x39AF40);
-            void* buf = padLeft(nameStr, total, u'\u3000');
-            if (buf != nullptr && buf != nameStr && Plausible(buf) &&
-                ManagedStrLen(buf) == total &&
-                RangeReadable(reinterpret_cast<unsigned char*>(buf) + 0x14,
-                              static_cast<size_t>(total) * 2u)) {
-                const char16_t* src = reinterpret_cast<const char16_t*>(
-                    reinterpret_cast<unsigned char*>(nameStr) + 0x14);
-                char16_t* dst = reinterpret_cast<char16_t*>(
-                    reinterpret_cast<unsigned char*>(buf) + 0x14);
-                dst[0] = u'\u4ECA';   /* 今 */
-                dst[1] = u'\u5929';   /* 天 */
-                dst[2] = u'\u662F';   /* 是 */
-                for (int i = 0; i < nlen; i++) {
-                    dst[3 + i] = src[i];
-                }
-                dst[3 + nlen] = u'\u7684';      /* 的 */
-                dst[4 + nlen] = u'\u751F';      /* 生 */
-                dst[5 + nlen] = u'\u65E5';      /* 日 */
-                final = buf;
-            }
-        }
-        void* msg = forCorner(final);
-        if (msg != nullptr && Plausible(msg)) {
-            addHud(msg);
-            g_hudState = 1;
-            unsigned pc = 0;
-            const int fl = ManagedStrLen(final);
-            if (fl > 0 && fl < 64) {
-                const char16_t* fp = reinterpret_cast<const char16_t*>(
-                    reinterpret_cast<unsigned char*>(final) + 0x14);
-                for (int i = 0; i < 4 && i < fl; i++) {
-                    pc |= static_cast<unsigned>(fp[i] & 0xFFu) << (i * 8);
-                }
-            }
-            g_hudChars = pc;
-        }
-        else {
-            g_hudState = 2;
-        }
-    }
-
     /* ---- FastAnimations slice 1: player single animations ---------------
      *
      * Hook the animation function ITSELF instead of Game1.Update.
@@ -12822,7 +12791,7 @@ namespace {
      * The value is kept as luck*100 rounded, so "did it change" is an integer
      * compare and the HUD string is only rebuilt when the number really moves.
      */
-    int   s_luckHundredths = 0;
+    int   s_luckThousandths = 0;
     int   s_luckShown = 0x7FFFFFFF;   /* value the HUD string was built from */
     int   s_luckFrame = 0;
 
@@ -12844,14 +12813,14 @@ namespace {
         if (!(v >= -1.0 && v <= 1.0)) {
             return;
         }
-        int h = static_cast<int>(v * 100.0 + (v >= 0.0 ? 0.5 : -0.5));
-        if (h < -100) {
-            h = -100;
+        int h = static_cast<int>(v * 1000.0 + (v >= 0.0 ? 0.5 : -0.5));
+        if (h < -1000) {
+            h = -1000;
         }
-        if (h > 100) {
-            h = 100;
+        if (h > 1000) {
+            h = 1000;
         }
-        s_luckHundredths = h;
+        s_luckThousandths = h;
     }
 
     /* Tier colours, straight out of UI Info Suite 2's LuckOfDay.  XNA packs
@@ -12861,22 +12830,29 @@ namespace {
         int g = 255;
         int b = 255;
         int a = 255;
-        if (h > 7) {
+        /* Ranges follow UI Info Suite 2 exactly: >0.07, >0.02, |x|<=0.02,
+         * 0, >=-0.07, below that.  The small-positive band (0.01..0.02) used
+         * to fall through to the "bad" colour, because only the negative half
+         * of that band was handled. */
+        if (h > 70) {
             r = 87;  g = 255; b = 106;          /* very good */
         }
-        else if (h > 2) {
+        else if (h > 20) {
             r = 148; g = 255; b = 210;          /* good */
         }
-        else if (h < 0 && h >= -2) {
-            r = 246; g = 255; b = 145;          /* slightly bad */
+        else if (h > 0) {
+            r = 246; g = 255; b = 145;          /* slightly good */
         }
         else if (h == 0) {
             r = 255; g = 255; b = 255;          /* neutral */
         }
-        else if (h >= -7) {
+        else if (h >= -20) {
+            r = 246; g = 255; b = 145;          /* slightly bad */
+        }
+        else if (h >= -70) {
             r = 255; g = 155; b = 155;          /* bad */
         }
-        else if (h < -7) {
+        else {
             r = 165; g = 165; b = 165; a = 204; /* very bad */
         }
         return (static_cast<unsigned>(a) << 24) |
@@ -12921,6 +12897,8 @@ namespace {
     int   s_toolRectH = 0;
     int   s_toolRectValid = 0;
     int   s_toolFrame = 0;
+    int   s_lastUpgradeDays = -1;   /* >0: draw the tool row */
+    int   s_probeFrame = 0;   /* phase-3 probe throttle, update hook only */
     void* s_toolSheet = nullptr;
 
     void SampleToolUpgrade() {
@@ -17136,6 +17114,13 @@ namespace {
      * the update hook calls it, and it must stay out of the draw path: see the
      * comment on the definition. */
     void BuildHudStrings();
+    void SampleDate();
+    void RunWeatherProbe();
+    void PollDayBoundary();
+    void PollDateIdentity();
+    void PollTimeRequest();
+    void ServiceTimeRequest();
+    void UpdateWeatherCache();
 
     void HookGameUpdate(void* self, void* gameTime) {
         EnsureSettings();
@@ -17191,15 +17176,41 @@ namespace {
          * taken here (once a second) and the HUD only draws the copy. */
         if (kHudInfo) {
             SampleDailyLuck();
-            if (++s_toolFrame >= 60) {
+            /* Once a second is enough to notice an upgrade starting, but the
+             * moment one does the row is drawn immediately while the icon is
+             * still the previous sample's -- which showed the fallback hammer
+             * for up to a second.  While a row is on screen with no sprite
+             * behind it, retry every frame instead. */
+            if (++s_toolFrame >= 60 ||
+                (s_lastUpgradeDays > 0 && s_toolRectValid == 0)) {
                 s_toolFrame = 0;
                 SampleToolUpgrade();
             }
             /* Strings are built here, not in the draw hook: ManagedStr
              * allocates a managed object, and allocating while the game is
              * mid-draw can trigger a collection that locks the console up. */
+            SampleDate();
+            /* Phase 4: cheap per-frame poll, no managed call. */
+            PollDayBoundary();
+            /* Read-only: slot vs the plain static copy. */
+            PollDateIdentity();
+            /* Read-only: set-time request slot, never applied here. */
+            PollTimeRequest();
+            /* Phase 4: cache state machine.  Cheap reads every frame; the
+             * managed chain runs at most once per day. */
+            UpdateWeatherCache();
+            /* Phase 3: the TV's own call sequence, once a second at most.
+             * Managed calls -- update hook only. */
+            if (++s_probeFrame >= 60) {
+                s_probeFrame = 0;
+                RunWeatherProbe();
+            }
             BuildHudStrings();
         }
+        /* Round 6: the request runs before the original _update, so the frame's
+         * own clock update still happens afterwards.  Everything it needs is
+         * checked here; it never runs from the overlay's thread. */
+        ServiceTimeRequest();
         if (s_origGameUpdate != nullptr) {
             s_origGameUpdate(self, gameTime);
         }
@@ -18357,6 +18368,13 @@ namespace {
         return at;
     }
 
+    /* Diagnostic helpers: low 32 bits of a pointer.  DiagLine lives below the
+     * cache it writes into. */
+    unsigned Ptr32(const void* p) {
+        return static_cast<unsigned>(
+            reinterpret_cast<uintptr_t>(p) & 0xFFFFFFFFu);
+    }
+
     /* Draws an already-built managed string.  Keeping the two steps apart means
      * the tool-upgrade line can be cached instead of rebuilt every frame. */
     void DrawHudString(void* msg, float x, float y, unsigned colour) {
@@ -18372,11 +18390,17 @@ namespace {
         drawString(batch, font, msg, colour, x, y);
     }
 
-    int  s_lastUpgradeDays = -1;   /* >0: draw the tool row */
     int  s_upgradeShown = -1;      /* value s_upgradeLine was built from */
     CachedStr s_upgradeLine{nullptr, 0, 0};
     CachedStr s_weatherLine{nullptr, 0, 0};
     CachedStr s_luckLine{nullptr, 0, 0};
+    CachedStr s_bdayLine{nullptr, 0, 0};
+    int  s_bdayKey = -2;
+    int  s_bdayShow = 0;
+    void* s_bdayNpc = nullptr;   /* resolved once per day, drawn from its sheet */
+    int   s_bdayCrop = 0;        /* head window inside that sheet */
+    int   s_bdayDbg = 0;         /* probe: 1 found, 2 sprite, 4 texture */
+    int   s_bdayBaked = 0;       /* 1 = draw the baked Leo head */
     int   s_weatherKey = -1;
     /* The string object we last built the weather line from.  The calendar key
      * alone is not enough: at load Game1.weatherForTomorrow still holds its
@@ -18385,8 +18409,114 @@ namespace {
      * while the TV said rain.  Strings are immutable in .NET, so a new value
      * is always a new pointer. */
     void* s_weatherPtr = nullptr;
-    CachedStr s_rawLine{nullptr, 0, 0};
+    /* The slot the weather line was built from, corrected.  The draw path used
+     * to re-read the field every frame, which is how the row could show "雨"
+     * next to a sunny icon while the text was stale. */
+    int   s_weatherSlot = -1;
+    int   s_weatherShownSlot = -2;
+
+    /* Committed weather for the current day.  Only ever written after the
+     * game's own function returned a value, never just because the date moved:
+     * hardware shows the date statics change 5 frames before the weather slot
+     * does, so an early commit would freeze the previous day's weather. */
+    int   s_wxValid = 0;
+    int   s_wxYear = -1;
+    int   s_wxSeason = -1;
+    int   s_wxDay = -1;
+    int   s_wxSlot = -1;
+    /* Date the loop last looked at, and how long the weather slot has been
+     * unchanged.  Both are frame-local bookkeeping, no managed state. */
+    int   s_wxSeenYear = -1;
+    int   s_wxSeenSeason = -1;
+    int   s_wxSeenDay = -1;
+    int   s_wxStable = 0;
+    void* s_wxLastPtr = nullptr;
+    /* Diagnostic block: one line per item, built in the update hook. */
+    constexpr int kDiagLines = 10;
+    CachedStr s_diag[kDiagLines]{};
+
+    /* Phase-3 probe result.  Filled in the update hook, formatted into
+     * s_diag there too; the draw path only reads the strings. */
+    struct WeatherProbe {
+        int version;
+        int ran;
+        int year;
+        int season;
+        int day;
+        int totalDays;
+        int stA;
+        int stB;
+        int stC;
+        void* strA;      /* 0xBBCAF28 chain */
+        void* strB;      /* 0xC95BE18, the one the TV reads */
+        int samePtr;
+        int tomorrowDays;
+        void* fcast;
+        int fcastSlot;
+        char rawA[12];
+        char rawB[12];
+        char rawF[12];
+    };
+    WeatherProbe s_probe{};
+    int s_diagVersion = -1;
+    int s_diagEvents = -1;
+
+    /* Read-only identity probe: is the slot pointer the same memory as the
+     * plain static copy the plugin writes?
+     *
+     *   slot       = *(0xBBBB290)            -- the object the game increments
+     *   slotDay    = *(int*)slot             -- its value, at offset 0
+     *   staticDay  = *(int*)0xC95BEB0        -- the second copy
+     *
+     * sameAddress is the only thing that proves "one storage"; sameValue alone
+     * only proves the numbers agree right now.  Nothing here writes memory. */
+    struct DateIdProbe {
+        unsigned frame;
+        unsigned slot;
+        unsigned staticAddr;
+        int slotDay;
+        int staticDay;
+        int sameAddr;
+        int sameVal;
+        int changes;        /* value or pointer moved */
+        unsigned lastChangeFrame;
+    };
+    DateIdProbe s_dateId{};
+    int s_dateIdDirty = 1;
+
+    /* Cross-day event log.  One entry per frame in which the date or the
+     * weather slot changed, in the order the update hook saw them -- that
+     * order is the whole point: it says whether the weather is refreshed
+     * before or after the date.  Pure memory reads, so it runs every frame. */
+    struct DayEvent {
+        unsigned frame;
+        char kind;          /* 'D' date, 'W' weather, 'B' both in one frame */
+        char text[12];
+    };
+    constexpr int kDayEvents = 5;
+    DayEvent s_events[kDayEvents]{};
+    int s_eventCount = 0;
+    unsigned s_frameCounter = 0;
+    int s_lastY = -1;
+    int s_lastS = -1;
+    int s_lastD = -1;
+    void* s_lastWx = nullptr;
+
+    void DiagLine(int i, const char* text) {
+        if (i < 0 || i >= kDiagLines || text == nullptr) {
+            return;
+        }
+        char16_t buf[64];
+        int n = 0;
+        for (int j = 0; text[j] != 0 && j < 62; j++) {
+            buf[n++] =
+                static_cast<char16_t>(static_cast<unsigned char>(text[j]));
+        }
+        buf[n] = 0;
+        CachedStrBuild(&s_diag[i], buf, n);
+    }
     void* s_rawPtr = nullptr;
+    int   s_rawVersion = -1;
 
     /* Reads a managed String.  Layout from the metadata: length at +0x10, the
      * first UTF-16 character at +0x14. */
@@ -18473,6 +18603,11 @@ namespace {
     };
     constexpr int kWeatherSlotCount =
         static_cast<int>(sizeof(kWeatherNames) / sizeof(kWeatherNames[0]));
+    /* Same order, ASCII, for the diagnostic lines only. */
+    constexpr const char* kSlotIds[] = {
+        "Sun", "Rain", "Storm", "Snow", "Wind", "GreenRain", "Festival",
+        "Wedding",
+    };
     static_assert(kWeatherSlotCount == kWeatherIconCount,
                   "weather name table and icon table must line up");
 
@@ -18484,11 +18619,6 @@ namespace {
             }
         }
         return -1;
-    }
-
-    const char16_t* WeatherLabel(void* str) {
-        const int slot = WeatherSlot(str);
-        return slot >= 0 ? kWeatherNames[slot] : nullptr;
     }
 
     /* The calendar is fixed: eight festivals a year, on the same dates every
@@ -18511,15 +18641,122 @@ namespace {
         const char16_t* name;
     };
     constexpr FestivalDate kFestivals[] = {
-        {0, 13, u"蛋蛋节"},
+        {0, 13, u"复活节"},
         {0, 24, u"花舞节"},
-        {1, 11, u"夏威夷宴"},
-        {1, 28, u"月光水母"},
-        {2, 16, u"星露谷展览"},
-        {2, 27, u"万圣节"},
+        {1, 11, u"夏威夷宴会"},
+        {1, 28, u"月光水母之舞"},
+        {2, 16, u"星露谷展览会"},
+        {2, 27, u"万灵节"},
         {3, 8, u"冰雪节"},
-        {3, 25, u"冬星节"},
+        {3, 25, u"冬日星盛宴"},
     };
+
+    /* Chinese name of whoever has a birthday on this date, or nullptr.
+     * The table is generated from Data/Characters (English names); the Chinese
+     * side lives in npc_names_cn.hpp because it comes from the localisation
+     * files, which are not in the NSO. */
+    const char16_t* BirthdayName(int season, int day) {
+        for (int i = 0; i < npcbday::kCount; i++) {
+            const npcbday::Entry& e = npcbday::kTable[i];
+            if (static_cast<int>(e.season) == season &&
+                static_cast<int>(e.day) == day) {
+                return npcname::Chinese(e.name);
+            }
+        }
+        return nullptr;
+    }
+
+    /* The NPC whose birthday falls on this date, or nullptr.  Same scan the
+     * map uses for its markers: every location's character list.  Runs once
+     * per day (from the HUD string builder), not per frame -- walking every
+     * location every frame would be wasteful for something that changes once
+     * a day.
+     *
+     * `spriteName` receives the character's sprite name, which is what
+     * npccrop::Lookup keys on to find the head window inside the sheet. */
+    void* FindBirthdayNpc(int season, int day, char* spriteName, int cap) {
+        if (spriteName == nullptr || cap < 2) {
+            return nullptr;
+        }
+        spriteName[0] = 0;
+        auto getLocations = reinterpret_cast<GetLocationsFn>(
+            g_base + kGetLocationsOff);
+        void* locList = getLocations();
+        void** locs = nullptr;
+        int locN = 0;
+        if (!ReadListRaw(locList, &locs, &locN)) {
+            return nullptr;
+        }
+        for (int i = 0; i < locN; i++) {
+            void* loc = locs[i];
+            if (loc == nullptr || !Plausible(loc) ||
+                !RangeReadable(loc, 0xB8u)) {
+                continue;
+            }
+            void* collection = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(loc) + 0xB0);
+            if (collection == nullptr || !Plausible(collection) ||
+                !RangeReadable(collection, 0x60u)) {
+                continue;
+            }
+            void* inner = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(collection) + 0x58);
+            void** npcs = nullptr;
+            int n = 0;
+            if (!ReadListRaw(inner, &npcs, &n)) {
+                continue;
+            }
+            for (int j = 0; j < n; j++) {
+                void* npc = npcs[j];
+                if (npc == nullptr || !Plausible(npc) ||
+                    !RangeReadable(npc, 0xC8u)) {
+                    continue;
+                }
+                /* nameAscii() is a lambda inside the map code; this is the
+                 * same two hops it does: NPC + 0xA8 -> NetString, + 0x68 ->
+                 * the managed string. */
+                void* netName = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(npc) + 0xA8);
+                if (netName == nullptr || !Plausible(netName) ||
+                    !RangeReadable(netName, 0x70u)) {
+                    continue;
+                }
+                void* nameStr = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(netName) + 0x68);
+                if (nameStr == nullptr) {
+                    continue;
+                }
+                char nm[16];
+                if (!NameToAscii(nameStr, nm, 16)) {
+                    continue;
+                }
+                int bs = 0;
+                int bd = 0;
+                if (!npcbday::Lookup(nm, &bs, &bd) || bs != season ||
+                    bd != day) {
+                    continue;
+                }
+                for (int k = 0; k + 1 < cap && nm[k] != 0; k++) {
+                    spriteName[k] = nm[k];
+                    spriteName[k + 1] = 0;
+                }
+                return npc;
+            }
+        }
+        return nullptr;
+    }
+
+    /* English name behind a birthday date, or nullptr. */
+    const char* BirthdayEnglish(int season, int day) {
+        for (int i = 0; i < npcbday::kCount; i++) {
+            const npcbday::Entry& e = npcbday::kTable[i];
+            if (static_cast<int>(e.season) == season &&
+                static_cast<int>(e.day) == day) {
+                return e.name;
+            }
+        }
+        return nullptr;
+    }
 
     /* Name of the festival on a given date, or nullptr. */
     const char16_t* FestivalName(int season, int day) {
@@ -18567,9 +18804,6 @@ namespace {
     }
 
     /* Weather id -> icon slot.  Order matches ICONS in tools/png_to_icons.py. */
-    int WeatherIconIndex(void* str) {
-        return WeatherSlot(str);
-    }
 
     /* Builds the three HUD strings.  Runs in the update hook, never while
      * drawing.
@@ -18581,6 +18815,573 @@ namespace {
      * it changes, so it looked like a random freeze rather than a repeatable
      * one.  Same rule as v392: managed calls live in update, draw only reads.
      */
+    /* Game1.Date -> WorldDate -> DayOfMonth / TotalDays.  The static ints
+     * (0xC95BE28 / 0xC95BEB0) freeze: they read d1 on day 2 and d5 on day 6,
+     * and because the HUD keys its rebuild on season*100+day, that froze the
+     * weather text while the icon -- drawn from the live string -- kept up.
+     * Sampled once a second; these are plain getters. */
+    int  s_year = 1;
+    int  s_season = 0;
+    int  s_day = 1;
+    int  s_totalDays = 0;
+    int  s_dateValid = 0;
+    int  s_dateFrame = 0;
+    int  s_dateVersion = 0;   /* bumps on every accepted sample */
+    /* Diagnostic only: the pointers the date was read through, so a bad read
+     * can be told apart from a bad string build. */
+    void* s_wdPtr = nullptr;
+    void* s_yearPtr = nullptr;
+    void* s_seasonPtr = nullptr;
+    void* s_dayPtr = nullptr;
+    int   s_dayRaw = -1;
+
+    /* One NetInt field of a WorldDate: the wrapper pointer, then +0x68. */
+    /* One NetInt field of a WorldDate, split in two so the diagnostic can
+     * print the wrapper pointer as well as the value. */
+    void* WorldDateWrapper(void* wd, uintptr_t off) {
+        if (wd == nullptr) {
+            return nullptr;
+        }
+        void** slot = reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(wd) + off);
+        if (!RangeReadable(slot, 8u)) {
+            return nullptr;
+        }
+        void* wrapper = *slot;
+        if (wrapper == nullptr || !Plausible(wrapper)) {
+            return nullptr;
+        }
+        return wrapper;
+    }
+
+    int WrapperValue(void* wrapper) {
+        if (wrapper == nullptr) {
+            return -1;
+        }
+        int* v = reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(wrapper) + kNetValueOff);
+        if (!RangeReadable(v, 4u)) {
+            return -1;
+        }
+        return *v;
+    }
+
+    void SampleDate() {
+        if (++s_dateFrame < 60) {
+            return;
+        }
+        s_dateFrame = 0;
+        void** slot =
+            *reinterpret_cast<void***>(g_base + kGame1DateSlotOff);
+        if (slot == nullptr || !Plausible(slot)) {
+            return;
+        }
+        void* netRef = *slot;
+        if (netRef == nullptr || !Plausible(netRef)) {
+            return;
+        }
+        void* wd = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(netRef) + kNetValueOff);
+        if (wd == nullptr || !Plausible(wd)) {
+            return;
+        }
+        void* yearWrapper = WorldDateWrapper(wd, kWorldDateYearOff);
+        void* seasonWrapper = WorldDateWrapper(wd, kWorldDateSeasonOff);
+        void* dayWrapper = WorldDateWrapper(wd, kWorldDateDayOff);
+        const int year = WrapperValue(yearWrapper);
+        const int season = WrapperValue(seasonWrapper);
+        const int day = WrapperValue(dayWrapper);
+        s_wdPtr = wd;
+        s_yearPtr = yearWrapper;
+        s_seasonPtr = seasonWrapper;
+        s_dayPtr = dayWrapper;
+        s_dayRaw = day;
+        if (year < 1 || year > 999 || season < 0 || season > 3 ||
+            day < 1 || day > 28) {
+            return;
+        }
+        s_year = year;
+        s_season = season;
+        s_day = day;
+        s_totalDays = (season + 4 * year) * 28 + day - 113;
+        s_dateValid = 1;
+        s_dateVersion++;
+    }
+
+    /* A static int behind one slot pointer: *(*(base+off)).  Game1.get_Date
+     * reads its three arguments exactly this way (ldr x8,[x8,#0x680] then
+     * ldr w1,[x8]). */
+    int ReadStaticInt(uintptr_t off) {
+        void** slot = reinterpret_cast<void**>(g_base + off);
+        if (!RangeReadable(slot, 8u)) {
+            return -1;
+        }
+        void* p = *slot;
+        if (p == nullptr || !RangeReadable(p, 4u)) {
+            return -1;
+        }
+        return *reinterpret_cast<int*>(p);
+    }
+
+    /* Managed string -> ASCII, for the diagnostic rows only. */
+    void StrToAscii(void* str, char* out, int cap) {
+        if (out == nullptr || cap <= 0) {
+            return;
+        }
+        out[0] = 0;
+        int len = 0;
+        const char16_t* chars = StrChars(str, &len);
+        int n = 0;
+        for (int i = 0; chars != nullptr && i < len && n < cap - 1; i++) {
+            const char16_t c = chars[i];
+            out[n++] = (c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?';
+        }
+        out[n] = 0;
+    }
+
+    /* Phase 3: the exact sequence TV.getWeatherForecast runs, on hardware.
+     *
+     * Everything here is a managed call, so it lives in the update hook.  The
+     * tomorrow object is created and consumed inside this one call and is
+     * never stored across frames -- see the GC note in docs/PHASE3_PROBE.md.
+     *
+     * Runs only when the date it reads back is self-consistent, so a load in
+     * progress or a half-built WorldDate cannot feed garbage into the ctor. */
+    void RunWeatherProbe() {
+        if (!kHudRawProbe || !kDeepWeatherProbe) {
+            return;
+        }
+        auto getDate = reinterpret_cast<void* (*)()>(g_base + kGetDateOff);
+        void* today = getDate();
+        if (today == nullptr || !Plausible(today)) {
+            return;
+        }
+        const int y = WrapperValue(WorldDateWrapper(today, kWorldDateYearOff));
+        const int s = WrapperValue(WorldDateWrapper(today, kWorldDateSeasonOff));
+        const int d = WrapperValue(WorldDateWrapper(today, kWorldDateDayOff));
+        if (y < 1 || y > 999 || s < 0 || s > 3 || d < 1 || d > 28) {
+            return;
+        }
+        auto getTd = reinterpret_cast<int (*)(void*)>(g_base + kGetTotalDaysOff);
+        const int td = getTd(today);
+
+        s_probe.year = y;
+        s_probe.season = s;
+        s_probe.day = d;
+        s_probe.totalDays = td;
+        s_probe.stA = ReadStaticInt(kStaticDateAOff);
+        s_probe.stB = ReadStaticInt(kStaticDateBOff);
+        s_probe.stC = ReadStaticInt(kStaticDateCOff);
+
+        void* outer =
+            *reinterpret_cast<void**>(g_base + kWeatherTomorrowSlotOff);
+        void* a = outer != nullptr ? *reinterpret_cast<void**>(outer) : nullptr;
+        void* b = *reinterpret_cast<void**>(g_base + kWeatherTvSlotOff);
+        s_probe.strA = a;
+        s_probe.strB = b;
+        s_probe.samePtr = a == b ? 1 : 0;
+        StrToAscii(a, s_probe.rawA, 12);
+        StrToAscii(b, s_probe.rawB, 12);
+
+        auto copyCtor = reinterpret_cast<void* (*)(void*, void*)>(
+            g_base + kWorldDateCopyCtorOff);
+        void* tomorrow = copyCtor(nullptr, today);
+        if (tomorrow == nullptr || !Plausible(tomorrow)) {
+            return;
+        }
+        const int td2 = getTd(tomorrow);
+        s_probe.tomorrowDays = td2 + 1;
+        auto setTd = reinterpret_cast<void (*)(void*, int)>(
+            g_base + kSetTotalDaysOff);
+        setTd(tomorrow, td2 + 1);
+
+        auto getMods = reinterpret_cast<void* (*)(void*, void*)>(
+            g_base + kGetWeatherModsOff);
+        void* result = getMods(tomorrow, b);
+        s_probe.fcast = result;
+        s_probe.fcastSlot = WeatherSlot(result);
+        StrToAscii(result, s_probe.rawF, 12);
+        s_probe.ran = 1;
+        s_probe.version++;
+    }
+
+    /* Cheap per-frame poll: three static ints and one slot pointer, no managed
+     * call, no allocation.  Records the order in which the calendar and the
+     * weather slot move across a day boundary.
+     *
+     * Both are read the way the game itself reads them: the date statics are
+     * *(*(base+off)) and the weather slot is a single hop (that is what TV does
+     * at 0x1A4A63C). */
+    void PollDayBoundary() {
+        if (!kHudRawProbe) {
+            return;
+        }
+        ++s_frameCounter;
+        const int y = ReadStaticInt(kStaticDateAOff);
+        const int s2 = ReadStaticInt(kStaticDateBOff);
+        const int d = ReadStaticInt(kStaticDateCOff);
+        void* w = *reinterpret_cast<void**>(g_base + kWeatherTvSlotOff);
+        if (s_lastY < 0) {
+            s_lastY = y;
+            s_lastS = s2;
+            s_lastD = d;
+            s_lastWx = w;
+            return;
+        }
+        const bool dateMoved = y != s_lastY || s2 != s_lastS || d != s_lastD;
+        const bool wxMoved = w != s_lastWx;
+        if (!dateMoved && !wxMoved) {
+            return;
+        }
+        DayEvent& e = s_events[s_eventCount % kDayEvents];
+        e.frame = s_frameCounter;
+        e.kind = dateMoved && wxMoved ? 'B' : (dateMoved ? 'D' : 'W');
+        if (dateMoved) {
+            snprintf(e.text, sizeof(e.text), "%d/%d/%d", y, s2, d);
+        }
+        else {
+            StrToAscii(w, e.text, 12);
+        }
+        ++s_eventCount;
+        s_lastY = y;
+        s_lastS = s2;
+        s_lastD = d;
+        s_lastWx = w;
+    }
+
+    /* Read-only: compare the slot the game increments with the plain static
+     * copy the Tesla plugin has been writing.
+     *
+     * Three reads, no managed call, no allocation, no writes.  Recorded only
+     * when something changes (or once every 30 frames) so the on-screen block
+     * does not churn. */
+    void PollDateIdentity() {
+        if (!kHudRawProbe) {
+            return;
+        }
+        void** slotPtr = reinterpret_cast<void**>(g_base + kStaticDateCOff);
+        if (!RangeReadable(slotPtr, 8u)) {
+            return;
+        }
+        void* slot = *slotPtr;
+        const uintptr_t staticAddr = g_base + kStaticDayCopyOff;
+
+        int slotDay = -1;
+        if (slot != nullptr && RangeReadable(slot, 4u)) {
+            slotDay = *reinterpret_cast<int*>(slot);
+        }
+        int staticDay = -1;
+        if (RangeReadable(reinterpret_cast<void*>(staticAddr), 4u)) {
+            staticDay = *reinterpret_cast<int*>(
+                reinterpret_cast<void*>(staticAddr));
+        }
+
+        const int sameAddr =
+            (reinterpret_cast<uintptr_t>(slot) == staticAddr) ? 1 : 0;
+        const int sameVal = (slotDay == staticDay) ? 1 : 0;
+
+        const int moved = (s_dateId.slot != Ptr32(slot)) ||
+                          (s_dateId.slotDay != slotDay) ||
+                          (s_dateId.staticDay != staticDay);
+        if (moved) {
+            ++s_dateId.changes;
+            s_dateId.lastChangeFrame = s_frameCounter;
+            s_dateIdDirty = 1;
+        }
+        s_dateId.frame = s_frameCounter;
+        s_dateId.slot = Ptr32(slot);
+        s_dateId.staticAddr = Ptr32(reinterpret_cast<void*>(staticAddr));
+        s_dateId.slotDay = slotDay;
+        s_dateId.staticDay = staticDay;
+        s_dateId.sameAddr = sameAddr;
+        s_dateId.sameVal = sameVal;
+    }
+
+    /* Read-only probe for the set-time request slot.  It deliberately uses its
+     * own observedSeq instead of the real consumer's doneSeq: this stage only
+     * has to prove the overlay's write is seen once, and it must not change the
+     * semantics of the queue that will later drive the actual clock change.
+     *
+     * Nothing here calls into the game.  Reject reasons:
+     *   1 = seq still 0 (never published)
+     *   2 = seq odd (writer mid-update)
+     *   3 = seq moved between the two loads (torn read)
+     *   4 = same seq as last time (already observed) */
+    struct TimeProbe {
+        unsigned observedSeq;
+        int      lastTarget;
+        unsigned accepted;
+        unsigned lastAcceptFrame;
+        unsigned frames;
+        int      lastReject;
+        unsigned rawSeq;
+        int      rawTarget;
+    };
+    TimeProbe s_timeProbe{};
+
+    void PollTimeRequest() {
+        if (!kHudRawProbe) {
+            return;
+        }
+        ++s_timeProbe.frames;
+        const unsigned seq1 =
+            __atomic_load_n(&g_timeRequest.seq, __ATOMIC_ACQUIRE);
+        s_timeProbe.rawSeq = seq1;
+        if (seq1 == 0u) {
+            s_timeProbe.lastReject = 1;
+            return;
+        }
+        if ((seq1 & 1u) != 0u) {
+            s_timeProbe.lastReject = 2;
+            return;
+        }
+        const int target = g_timeRequest.target;
+        s_timeProbe.rawTarget = target;
+        const unsigned seq2 =
+            __atomic_load_n(&g_timeRequest.seq, __ATOMIC_ACQUIRE);
+        if (seq1 != seq2) {
+            s_timeProbe.lastReject = 3;
+            return;
+        }
+        if (seq1 == s_timeProbe.observedSeq) {
+            s_timeProbe.lastReject = 4;
+            return;
+        }
+        s_timeProbe.observedSeq = seq1;
+        s_timeProbe.lastTarget = target;
+        s_timeProbe.lastAcceptFrame = s_frameCounter;
+        ++s_timeProbe.accepted;
+        s_timeProbe.lastReject = 0;
+    }
+
+    /* ---------------------------------------------------------------------
+     * Set-time execution (round 6: controlled integration).
+     *
+     * The overlay publishes a request; the work has to happen here because
+     * performTenMinuteClockUpdate touches the HUD, the music, the menus and the
+     * farmer, and only this thread may do that.
+     *
+     * One seq is one attempt, never retried:
+     *   Pending  published, not looked at yet
+     *   Blocked  valid, but the game is not in a state we accept.  The request
+     *            is kept and re-checked; the reason is recorded once per seq,
+     *            not once per frame
+     *   Running  consumed, the ten-minute updates are running
+     *   Success  timeOfDay equals the target afterwards
+     *   Failed   consumed, but the clock did not land on the target
+     * ------------------------------------------------------------------- */
+    struct TimeExec {
+        settime::State q;        /* doneSeq: the seq that was consumed */
+        unsigned seenSeq;        /* observedSeq: the seq last looked at */
+        unsigned resultSeq;
+        unsigned blockedSeq;     /* seq currently blocked, so it logs once */
+        int      resultCode;     /* 0 none 1 ok 2 bad target 3 blocked
+                                  * 4 clock did not land 5 clock unreadable */
+        int      blockedReason;
+        int      calls;          /* performTenMinuteClockUpdate calls made */
+        int      before;
+        int      after;
+        int      target;
+    };
+    TimeExec s_exec{};
+
+    void* g_perfTenMinute = nullptr;
+    int   g_perfCalls = 0;
+
+    /* ApplyTarget takes a plain function pointer, so the count has to come from
+     * the callee.  This is the only wrapper: it forwards to the game's own
+     * function and nothing else. */
+    void PerfTenMinuteCounted() {
+        ++g_perfCalls;
+        reinterpret_cast<void (*)()>(g_perfTenMinute)();
+    }
+
+    int* TimeOfDayPtr() {
+        void** slot = reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(g_base) +
+            settime::kTimeOfDaySlotOff);
+        return slot != nullptr ? reinterpret_cast<int*>(*slot) : nullptr;
+    }
+
+    /* 0 = allowed, otherwise why not.
+     *
+     * Only signals this build has actually exercised are used.  get_CurrentEvent
+     * is already sampled every frame for the HUD, and a festival puts the player
+     * inside an event, so the event check covers festivals too.  Scene
+     * transitions, open menus and pause have no confirmed field here; guessing
+     * one is how a set-time ends up running inside a load, so those states are
+     * excluded by the test protocol instead of by a made-up check. */
+    int TimeGateReason(int target, int* outNow) {
+        auto getEvent = reinterpret_cast<void* (*)(void*)>(
+            g_base + kGetCurrentEventOff);
+        if (getEvent(nullptr) != nullptr) {
+            return 1;                       /* event or cutscene running */
+        }
+        int* now = TimeOfDayPtr();
+        if (now == nullptr || !settime::IsValidClock(*now)) {
+            return 2;                       /* clock unreadable / out of range */
+        }
+        if (outNow != nullptr) {
+            *outNow = *now;
+        }
+        if (!settime::IsValidTarget(target)) {
+            return 3;
+        }
+        return 0;
+    }
+
+    void ServiceTimeRequest() {
+        if (!kTimeExec || g_base == 0) {
+            return;
+        }
+        unsigned seq = 0;
+        int target = 0;
+        if (!settime::PeekEx(&g_timeRequest, s_exec.q.doneSeq, &seq, &target)) {
+            return;                         /* nothing new, or mid-write */
+        }
+        if (seq != s_exec.seenSeq) {
+            s_exec.seenSeq = seq;
+            s_exec.target = target;
+            s_exec.blockedSeq = 0;
+        }
+        /* An impossible target is refused and consumed.  Leaving it pending
+         * would repeat the same refusal every frame forever. */
+        if (!settime::IsValidTarget(target)) {
+            settime::ConsumeSeq(&s_exec.q, seq);
+            s_exec.resultSeq = seq;
+            s_exec.resultCode = 2;
+            s_exec.before = 0;
+            s_exec.after = 0;
+            s_exec.calls = 0;
+            return;
+        }
+        int now = 0;
+        const int reason = TimeGateReason(target, &now);
+        if (reason != 0) {
+            /* Kept, not consumed: a blocked request should still run once the
+             * game is back in a state we accept.  Recorded once per seq. */
+            if (s_exec.blockedSeq != seq) {
+                s_exec.blockedSeq = seq;
+                s_exec.blockedReason = reason;
+                s_exec.resultSeq = seq;
+                s_exec.resultCode = 3;
+            }
+            return;
+        }
+        /* Consume first.  If the clock change faults half way through, the next
+         * frame must not start the same sequence again -- a partial advance is
+         * recoverable by asking again, a double advance is not. */
+        settime::ConsumeSeq(&s_exec.q, seq);
+        s_exec.blockedSeq = 0;
+        s_exec.resultSeq = seq;
+        s_exec.before = now;
+        s_exec.calls = 0;
+        g_perfCalls = 0;
+        g_perfTenMinute =
+            reinterpret_cast<void*>(g_base + settime::kPerfTenMinuteOff);
+        settime::ApplyTarget(reinterpret_cast<void*>(g_base), target,
+                             &PerfTenMinuteCounted);
+        s_exec.calls = g_perfCalls;
+        int* live = TimeOfDayPtr();
+        s_exec.after = live != nullptr ? *live : -1;
+        s_exec.resultCode = (s_exec.after == target) ? 1 : 4;
+    }
+
+    /* The TV's own computation, once: get_Date -> copy -> +1 day -> ask the
+     * game's function.  Returns false (and commits nothing) if any step did
+     * not produce a usable value.  Managed calls -- update hook only. */
+    bool ComputeWeatherSlot(int* outSlot) {
+        if (outSlot == nullptr) {
+            return false;
+        }
+        auto getDate = reinterpret_cast<void* (*)()>(g_base + kGetDateOff);
+        void* today = getDate();
+        if (today == nullptr || !Plausible(today)) {
+            return false;
+        }
+        const int y = WrapperValue(WorldDateWrapper(today, kWorldDateYearOff));
+        const int s = WrapperValue(WorldDateWrapper(today, kWorldDateSeasonOff));
+        const int d = WrapperValue(WorldDateWrapper(today, kWorldDateDayOff));
+        if (y < 1 || y > 999 || s < 0 || s > 3 || d < 1 || d > 28) {
+            return false;
+        }
+        auto copyCtor = reinterpret_cast<void* (*)(void*, void*)>(
+            g_base + kWorldDateCopyCtorOff);
+        void* tomorrow = copyCtor(nullptr, today);
+        if (tomorrow == nullptr || !Plausible(tomorrow)) {
+            return false;
+        }
+        auto getTd = reinterpret_cast<int (*)(void*)>(g_base + kGetTotalDaysOff);
+        auto setTd = reinterpret_cast<void (*)(void*, int)>(
+            g_base + kSetTotalDaysOff);
+        setTd(tomorrow, getTd(tomorrow) + 1);
+        void* base = *reinterpret_cast<void**>(g_base + kWeatherTvSlotOff);
+        if (base == nullptr || !Plausible(base)) {
+            return false;
+        }
+        auto getMods = reinterpret_cast<void* (*)(void*, void*)>(
+            g_base + kGetWeatherModsOff);
+        void* result = getMods(tomorrow, base);
+        if (result == nullptr || !Plausible(result)) {
+            return false;
+        }
+        const int slot = WeatherSlot(result);
+        *outSlot = slot >= 0 ? slot : -1;
+        return true;
+    }
+
+    /* Cache state machine, one cheap pass per frame.
+     *
+     *   idle   -- date and cached date agree, nothing to do
+     *   pending-- date moved; wait until the weather slot has been unchanged
+     *             for kWeatherStableFrames
+     *   compute-- run the chain; commit ONLY on success
+     *
+     * The stability window restarts on every weather write and on every date
+     * change, so the 5-frame gap seen on hardware (date f24874, weather
+     * f24879) can never be read as final. */
+    void UpdateWeatherCache() {
+        const int y = ReadStaticInt(kStaticDateAOff);
+        const int s = ReadStaticInt(kStaticDateBOff);
+        const int d = ReadStaticInt(kStaticDateCOff);
+        if (y < 1 || y > 999 || s < 0 || s > 3 || d < 1 || d > 28) {
+            s_wxStable = 0;
+            return;
+        }
+        void* w = *reinterpret_cast<void**>(g_base + kWeatherTvSlotOff);
+        if (w != s_wxLastPtr) {
+            s_wxLastPtr = w;
+            s_wxStable = 0;
+        }
+        else if (s_wxStable < kWeatherStableFrames) {
+            ++s_wxStable;
+        }
+        if (s_wxValid != 0 && y == s_wxYear && s == s_wxSeason &&
+            d == s_wxDay) {
+            return;
+        }
+        if (y != s_wxSeenYear || s != s_wxSeenSeason || d != s_wxSeenDay) {
+            s_wxSeenYear = y;
+            s_wxSeenSeason = s;
+            s_wxSeenDay = d;
+            s_wxStable = 0;      /* date moved: restart the window, do not
+                                  * compute on this frame */
+            return;
+        }
+        if (s_wxStable < kWeatherStableFrames) {
+            return;
+        }
+        int slot = -1;
+        if (!ComputeWeatherSlot(&slot)) {
+            return;              /* stay pending, retry next frame */
+        }
+        s_wxSlot = slot;
+        s_wxYear = y;
+        s_wxSeason = s;
+        s_wxDay = d;
+        s_wxValid = 1;
+    }
+
     /* Two hops: the cached slot pointer, then the string itself.  Either hop
      * can be null early in a load, so both are checked.
      *
@@ -18588,51 +19389,43 @@ namespace {
      * was tried on 2026-11-06 and reverted: GetWeatherForLocation("Default")
      * returned a fresh LocationWeather whose WeatherForTomorrow is the default
      * "Sun", so the row went back to always saying 晴. */
-    void* WeatherTomorrow() {
-        void** slot =
-            *reinterpret_cast<void***>(g_base + kWeatherTomorrowSlotOff);
-        if (slot == nullptr || !Plausible(slot)) {
-            return nullptr;
-        }
-        return *slot;
-    }
-
     void BuildHudStrings() {
         if (!kHudInfo) {
             return;
         }
 
-        /* Tomorrow's weather.  Rebuilt only when the calendar day changes. */
-        void* weather = WeatherTomorrow();
-        const int season = *reinterpret_cast<const int*>(g_base + kSeasonOff);
-        const int day = *reinterpret_cast<const int*>(g_base + kDayOfMonthOff);
-        const int key = season * 100 + day;
-        if (key != s_weatherKey || weather != s_weatherPtr ||
+        /* Tomorrow's weather, taken from the cache and nowhere else.
+         *
+         * The cache is only committed after getWeatherModificationsForDate
+         * returned, and only once the date and the weather slot have both
+         * settled -- so this block never computes, it only picks a label for a
+         * slot.  The old path read weatherForTomorrow and corrected it here,
+         * which is exactly why a new save showed the base weather (Sun on
+         * Spring 2) while the TV said rain. */
+        const int key = s_wxValid != 0
+                            ? s_wxYear * 10000 + s_wxSeason * 100 + s_wxDay
+                            : -1;
+        if (key != s_weatherKey || s_wxSlot != s_weatherShownSlot ||
             !CachedStrOk(s_weatherLine)) {
             s_weatherKey = key;
-            s_weatherPtr = weather;
-            const char16_t* label = WeatherLabel(weather);
-            /* A festival day arrives as the weather id "Festival", which is
-             * useless on its own -- the calendar knows which one it is, so
-             * say so: "明日 花舞节" instead of "明日 节日". */
-            if (WeatherSlot(weather) == 6) {
-                int ts = 0;
-                int td = 0;
-                NextDate(season, day, &ts, &td);
+            s_weatherShownSlot = s_wxSlot;
+            const int slot = s_wxValid != 0 ? s_wxSlot : -1;
+            s_weatherSlot = slot;
+            const char16_t* label =
+                (slot >= 0 && slot < kWeatherSlotCount) ? kWeatherNames[slot]
+                                                        : nullptr;
+            /* A festival day arrives as "Festival", which is useless on its
+             * own -- the calendar knows which one it is, so say so:
+             * "明日 花舞节" instead of "明日 节日".  The name table is ours;
+             * the decision to show a festival at all came from the game. */
+            if (slot == 6 && s_wxValid != 0) {
+                int ts = s_wxSeason;
+                int td = s_wxDay;
+                NextDate(s_wxSeason, s_wxDay, &ts, &td);
                 const char16_t* name = FestivalName(ts, td);
                 if (name != nullptr) {
                     label = name;
                 }
-            }
-            /* The TV does not show the raw field during the first days of a
-             * save: it runs getWeatherModificationsForDate first, which forces
-             * the tutorial weather (DaysPlayed + 1 <= 4 -> Sun, == 3 -> Rain).
-             * A save can only start in Spring of year 1, so season 0 with
-             * day <= 3 is exactly that window -- the field itself still holds
-             * the current day's weather there, which is what made the row look
-             * one day behind on a new save. */
-            if (season == 0 && day >= 1 && day <= 3) {
-                label = (day == 2) ? u"雨" : u"晴";
             }
             char16_t buf[32];
             int n = 0;
@@ -18646,56 +19439,217 @@ namespace {
                 }
             }
             else {
-                /* Unknown id: show it raw rather than showing nothing.  This
-                 * is how v409 found out a clear day is called "Sun" -- the
-                 * fallback is the only reason that was visible at all. */
-                int rawLen = 0;
-                const char16_t* raw = StrChars(weather, &rawLen);
-                for (int i = 0; raw != nullptr && i < rawLen && n < 30; i++) {
-                    buf[n++] = raw[i];
-                }
+                /* Nothing committed yet, or an id we do not map: show a dash
+                 * rather than a stale word. */
+                buf[n++] = u'?';
             }
             buf[n] = 0;
             CachedStrBuild(&s_weatherLine, buf, n);
         }
 
-        if (kHudRawProbe &&
-            (weather != s_rawPtr || !CachedStrOk(s_rawLine))) {
-            s_rawPtr = weather;
-            char16_t buf[48];
-            int n = 0;
-            const char16_t pre[] = u"raw:";
-            for (int i = 0; pre[i] != 0 && n < 8; i++) {
-                buf[n++] = pre[i];
+        if (kHudRawProbe && (s_probe.version != s_diagVersion ||
+                             s_eventCount != s_diagEvents ||
+                             s_dateIdDirty != 0 ||
+                             (s_frameCounter % 30u) == 0u ||
+                             !CachedStrOk(s_diag[0]))) {
+            s_diagVersion = s_probe.version;
+            s_diagEvents = s_eventCount;
+            s_dateIdDirty = 0;
+            char tmp[64];
+            if (s_probe.ran == 0) {
+                DiagLine(0, "probe: not run yet");
             }
-            int rawLen = 0;
-            const char16_t* raw = StrChars(weather, &rawLen);
-            for (int i = 0; raw != nullptr && i < rawLen && n < 24; i++) {
-                buf[n++] = raw[i];
+            else {
+                snprintf(tmp, sizeof(tmp), "date y%d s%d d%d td%d",
+                         s_probe.year, s_probe.season, s_probe.day,
+                         s_probe.totalDays);
+                DiagLine(0, tmp);
             }
-            buf[n++] = u' ';
-            buf[n++] = u'd';
-            n = AppendUnsigned(buf, n, day);
-            buf[n] = 0;
-            CachedStrBuild(&s_rawLine, buf, n);
+            /* Identity probe: the slot the game increments, the plain static
+             * copy the plugin writes, and whether they are the same memory. */
+            snprintf(tmp, sizeof(tmp), "slot=%08x d=%d", s_dateId.slot,
+                     s_dateId.slotDay);
+            DiagLine(1, tmp);
+            snprintf(tmp, sizeof(tmp), "copy=%08x d=%d", s_dateId.staticAddr,
+                     s_dateId.staticDay);
+            DiagLine(2, tmp);
+            snprintf(tmp, sizeof(tmp), "sameA=%d sameV=%d chg=%d f%u",
+                     s_dateId.sameAddr, s_dateId.sameVal, s_dateId.changes,
+                     s_dateId.lastChangeFrame);
+            DiagLine(3, tmp);
+            /* Newest events last, oldest first, so the order on screen is the
+             * order they happened. */
+            for (int i = 0; i < 3; i++) {
+                const int idx = s_eventCount - 3 + i;
+                if (idx < 0) {
+                    DiagLine(4 + i, "");
+                    continue;
+                }
+                const DayEvent& e = s_events[idx % kDayEvents];
+                snprintf(tmp, sizeof(tmp), "f%u %c %s", e.frame, e.kind,
+                         e.text);
+                DiagLine(4 + i, tmp);
+            }
+            /* Set-time request slot, read-only.  `n` is the accepted count,
+             * `rej` the last reject reason (0 ok, 1 zero, 2 odd, 3 torn, 4 dup). */
+            snprintf(tmp, sizeof(tmp), "req seq=%u tgt=%d n=%u",
+                     s_timeProbe.rawSeq, s_timeProbe.rawTarget,
+                     s_timeProbe.accepted);
+            DiagLine(7, tmp);
+            snprintf(tmp, sizeof(tmp), "acc seq=%u tgt=%d f%u rej=%d",
+                     s_timeProbe.observedSeq, s_timeProbe.lastTarget,
+                     s_timeProbe.lastAcceptFrame, s_timeProbe.lastReject);
+            DiagLine(8, tmp);
+            /* Round 6: what the executor did with the last request it looked
+             * at.  `c` is the number of performTenMinuteClockUpdate calls,
+             * `before>after` the clock either side of them.  A blocked request
+             * shows why instead, and keeps showing it -- the request is still
+             * pending. */
+            if (s_exec.resultCode == 3) {
+                snprintf(tmp, sizeof(tmp), "exec #%u BLK tgt=%d why=%d",
+                         s_exec.resultSeq, s_exec.target, s_exec.blockedReason);
+            }
+            else {
+                static const char* const kCode[] = {"--", "OK", "BAD", "BLK",
+                                                    "MIS"};
+                const int c = s_exec.resultCode >= 0 && s_exec.resultCode <= 4
+                                  ? s_exec.resultCode
+                                  : 0;
+                snprintf(tmp, sizeof(tmp), "exec #%u %s tgt=%d %d>%d c=%d",
+                         s_exec.resultSeq, kCode[c], s_exec.target,
+                         s_exec.before, s_exec.after, s_exec.calls);
+            }
+            DiagLine(9, tmp);
         }
 
-        /* Daily luck.  s_luckHundredths is sampled once a second in update. */
-        if (s_luckHundredths != s_luckShown || !CachedStrOk(s_luckLine)) {
-            s_luckShown = s_luckHundredths;
+        /* Birthday: today's first, then tomorrow's.  One row, no icon.
+         * The map badges that used to carry this were removed on purpose --
+         * the same fact in two places is how they drift apart. */
+        {
+            const int bkey =
+                s_wxValid != 0 ? s_wxYear * 10000 + s_wxSeason * 100 + s_wxDay
+                               : -1;
+            /* CachedStrOk() reports a zero-length string as invalid, so an
+             * "empty row" built here would be rebuilt -- and reallocated --
+             * every single frame.  That is a managed allocation per frame,
+             * which is how this ended up crashing during a location load.
+             * Nobody's birthday means no string at all, not an empty one. */
+            if (bkey != s_bdayKey ||
+                (s_bdayShow != 0 && !CachedStrOk(s_bdayLine))) {
+                s_bdayKey = bkey;
+                const char16_t* name = nullptr;
+                const char16_t* pre = nullptr;
+                int bs = s_wxSeason;
+                int bd = s_wxDay;
+                s_bdayNpc = nullptr;
+                s_bdayCrop = 0;
+                /* Today only.  Showing tomorrow's as well was noise: the
+                 * row exists to remind you to hand over a gift today. */
+                if (s_wxValid != 0) {
+                    name = BirthdayName(bs, bd);
+                    pre = u"今日 ";
+                }
+                s_bdayShow = name != nullptr ? 1 : 0;
+                if (name != nullptr) {
+                    /* Their head, drawn from the same sheet the map markers
+                     * use.  The sprite name picks the window inside it. */
+                    char sprite[16];
+                    s_bdayNpc = FindBirthdayNpc(bs, bd, sprite, 16);
+                    s_bdayBaked = 0;
+                    if (s_bdayNpc == nullptr) {
+                        /* Leo lives on Ginger Island and is absent from
+                         * Game1.locations unless it is loaded.  His head is
+                         * baked into the binary, so draw that instead. */
+                        const char* en = BirthdayEnglish(bs, bd);
+                        if (en != nullptr && std::strcmp(en, "Leo") == 0) {
+                            s_bdayBaked = 1;
+                        }
+                    }
+                    s_bdayDbg = s_bdayNpc != nullptr ? 1 : 0;
+                    if (s_bdayNpc != nullptr && Plausible(s_bdayNpc) &&
+                        RangeReadable(s_bdayNpc, 0x58u)) {
+                        void* ns = *reinterpret_cast<void**>(
+                            reinterpret_cast<unsigned char*>(s_bdayNpc) + 0x50);
+                        if (ns != nullptr && Plausible(ns) &&
+                            RangeReadable(ns, 0x70u)) {
+                            void* sp = *reinterpret_cast<void**>(
+                                reinterpret_cast<unsigned char*>(ns) + 0x68);
+                            if (sp != nullptr && Plausible(sp) &&
+                                RangeReadable(sp, 0x18u)) {
+                                s_bdayDbg |= 2;
+                                void* tx = *reinterpret_cast<void**>(
+                                    reinterpret_cast<unsigned char*>(sp) + 0x10);
+                                void* wt = *reinterpret_cast<void**>(
+                                    g_base + kStaminaRectOff);
+                                void* mt = (wt != nullptr && Plausible(wt))
+                                               ? *reinterpret_cast<void**>(wt)
+                                               : nullptr;
+                                if (tx != nullptr && mt != nullptr &&
+                                    Plausible(tx) &&
+                                    *reinterpret_cast<void**>(tx) == mt) {
+                                    s_bdayDbg |= 4;
+                                }
+                            }
+                        }
+                    }
+                    s_bdayCrop = npccrop::Lookup(sprite);
+                    if (s_bdayCrop < 0) {
+                        s_bdayCrop = 0;
+                    }
+                    if (s_bdayCrop > 40) {
+                        s_bdayCrop = 40;
+                    }
+                    char16_t buf[40];
+                    int n = 0;
+                    for (int i = 0; pre[i] != 0 && n < 8; i++) {
+                        buf[n++] = pre[i];
+                    }
+                    for (int i = 0; name[i] != 0 && n < 30; i++) {
+                        buf[n++] = name[i];
+                    }
+                    const char16_t suf[] = u"生日";
+                    if (kHudRawProbe) {
+                        /* dev only: f=found s=sprite t=texture */
+                        const char16_t tag[] = u" f0s0t0";
+                        for (int i = 0; tag[i] != 0 && n < 34; i++) {
+                            buf[n++] = tag[i];
+                        }
+                        buf[n - 5] = static_cast<char16_t>(
+                            u'0' + (s_bdayDbg & 1));
+                        buf[n - 3] = static_cast<char16_t>(
+                            u'0' + ((s_bdayDbg >> 1) & 1));
+                        buf[n - 1] = static_cast<char16_t>(
+                            u'0' + ((s_bdayDbg >> 2) & 1));
+                    }
+                    for (int i = 0; suf[i] != 0 && n < 38; i++) {
+                        buf[n++] = suf[i];
+                    }
+                    buf[n] = 0;
+                    CachedStrBuild(&s_bdayLine, buf, n);
+                }
+            }
+        }
+
+        /* Daily luck.  s_luckThousandths is sampled once a second in update. */
+        if (s_luckThousandths != s_luckShown || !CachedStrOk(s_luckLine)) {
+            s_luckShown = s_luckThousandths;
             char16_t buf[32];
             int n = 0;
             const char16_t pre[] = u"今日运气 ";
             for (int i = 0; pre[i] != 0 && n < 20; i++) {
                 buf[n++] = pre[i];
             }
-            const int hundredths = s_luckHundredths;
-            const int mag = hundredths < 0 ? -hundredths : hundredths;
-            buf[n++] = hundredths < 0 ? u'-' : u'+';
-            n = AppendUnsigned(buf, n, mag / 100);
+            /* Three decimals: the value is the daily roll (steps of 0.01) plus
+             * LuckLevel * 0.001, so the third digit is real information, not
+             * noise.  UI Info Suite 2 prints it the same way (N3). */
+            const int thousandths = s_luckThousandths;
+            const int mag = thousandths < 0 ? -thousandths : thousandths;
+            buf[n++] = thousandths < 0 ? u'-' : u'+';
+            n = AppendUnsigned(buf, n, mag / 1000);
             buf[n++] = u'.';
-            const int frac = mag % 100;
-            buf[n++] = static_cast<char16_t>(u'0' + frac / 10);
+            const int frac = mag % 1000;
+            buf[n++] = static_cast<char16_t>(u'0' + frac / 100);
+            buf[n++] = static_cast<char16_t>(u'0' + (frac / 10) % 10);
             buf[n++] = static_cast<char16_t>(u'0' + frac % 10);
             buf[n] = 0;
             CachedStrBuild(&s_luckLine, buf, n);
@@ -18721,12 +19675,12 @@ namespace {
         if (days != s_upgradeShown || !CachedStrOk(s_upgradeLine)) {
             char16_t buf[40];
             int n = 0;
-            const char16_t prefix[] = u"工具升级 剩余 ";
+            const char16_t prefix[] = u"升级还剩";
             for (int i = 0; prefix[i] != 0 && n < 30; i++) {
                 buf[n++] = prefix[i];
             }
             n = AppendUnsigned(buf, n, days);
-            const char16_t tail[] = u" 天";
+            const char16_t tail[] = u"天";
             for (int i = 0; tail[i] != 0 && n < 36; i++) {
                 buf[n++] = tail[i];
             }
@@ -18743,28 +19697,30 @@ namespace {
         /* Nothing here may allocate: every string below was built in the
          * update hook.  DrawHudString ignores a null or implausible object. */
         DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
-        if (kIconProbe) {
-            /* Our own art, encoded as filled rectangles: no texture to load.
-             * The slot is null until that icon has been drawn, so a missing
-             * icon simply shows the text alone instead of drawing garbage. */
-            void* weather = WeatherTomorrow();
-            const int idx = WeatherIconIndex(weather);
-            if (idx >= 0 && idx < kWeatherIconCount &&
-                kWeatherIcons[idx].count > 0) {
-                void* white =
-                    *reinterpret_cast<void**>(g_base + kStaminaRectOff);
-                if (Plausible(white)) {
-                    DrawIconRuns(white, kWeatherIcons[idx].runs,
-                                 kWeatherIcons[idx].count,
-                                 kHudIconX, kHudIconY, kHudIconScale);
-                }
+        /* Our own art, encoded as filled rectangles: no texture to load.
+         * The slot is null until that icon has been drawn, so a missing
+         * icon simply shows the text alone instead of drawing garbage. */
+        /* Same slot the text was built from, not a fresh read of the
+         * field -- otherwise the icon shows the base weather while the
+         * text shows the corrected one. */
+        const int idx = s_weatherSlot;
+        if (idx >= 0 && idx < kWeatherIconCount &&
+            kWeatherIcons[idx].count > 0) {
+            void* white =
+                *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+            if (Plausible(white)) {
+                DrawIconRuns(white, kWeatherIcons[idx].runs,
+                             kWeatherIcons[idx].count,
+                             kHudIconX, kHudIconY, kHudIconScale);
             }
         }
+
 
         /* Daily luck.  Icon comes from the game's own cursor sheet -- the same
          * 10x14 region UI Info Suite 2 uses -- tinted by tier so the colour
          * answers the question before you read the number. */
-        DrawHudString(s_luckLine.obj, kHudTextX, kHudLuckTextY, 0xFFFFFFFFu);
+        DrawHudString(s_luckLine.obj, kHudCol1X + 72, kHudLuckTextY,
+                      0xFFFFFFFFu);
         {
             void* batch =
                 *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
@@ -18782,8 +19738,16 @@ namespace {
                 }
                 const int iw = 10 * kHudLuckScale;
                 const int ih = 14 * kHudLuckScale;
+                /* The 10x14 luck sprite has about three rows of transparent
+                 * pixels under the die, so drawing the whole 14 rows at 4x
+                 * leaves 12px of empty space at the bottom and the visible
+                 * die sits 12px above the text's centre line.  Measured off a
+                 * screenshot: text centre y=125, die centre y=113.  Nudge the
+                 * destination down by that much so the die looks centred. */
                 const u64 dxy =
-                    (static_cast<u64>(static_cast<u32>(kHudLuckY)) << 32) |
+                    (static_cast<u64>(
+                         static_cast<u32>(kHudLuckY + kHudLuckArtDy))
+                     << 32) |
                     static_cast<u32>(kHudLuckX);
                 const u64 dwh =
                     (static_cast<u64>(static_cast<u32>(ih)) << 32) |
@@ -18791,13 +19755,100 @@ namespace {
                 auto drawSprite =
                     reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
                 drawSprite(batch, cursors, dxy, dwh, &src,
-                           LuckColour(s_luckHundredths), 0.0f, 0.0f, 0.0f,
+                           LuckColour(s_luckThousandths), 0.0f, 0.0f, 0.0f,
                            1.0f, 0);
             }
         }
 
         if (kHudRawProbe) {
-            DrawHudString(s_rawLine.obj, kHudTextX, 232.0f, 0xFFFFFF00u);
+            for (int i = 0; i < kDiagLines; i++) {
+                /* These strings are rebuilt at most once every 30 frames and
+                 * have no GC root: the module's data segment is not scanned, so
+                 * a collection inside that window frees the object while the
+                 * pointer stays here.  Drawing a freed string hands the game's
+                 * font code a length from whatever reused the block.  That is
+                 * how walking out of the cabin -- a load, which allocates hard
+                 * -- turned into "software error".  Skip a line that no longer
+                 * matches what was built instead of drawing it. */
+                if (!CachedStrOk(s_diag[i])) {
+                    continue;
+                }
+                DrawHudString(s_diag[i].obj, kHudTextX,
+                              232.0f + static_cast<float>(i) * 18.0f,
+                              0xFFFFFF00u);
+            }
+        }
+
+        /* Second row.  The tool row owns the left slot, so the birthday takes
+         * the right column while an upgrade is running and moves back to the
+         * left when it is not -- that way each row still lines up with the
+         * column above it. */
+        const int bdayRowY = kHudRow1Y;                       /* 100 */
+        const int bdayColX = s_lastUpgradeDays > 0 ? kHudCol1X : kHudIconX;
+        /* The head is 16x15 at 4x (64x60), read from the character's own
+         * sheet every frame -- a cached texture pointer would go stale the
+         * moment the game reloads one, and drawing a dead texture is a crash. */
+        if (s_bdayShow != 0) {
+            if (s_bdayBaked != 0) {
+                void* white = *reinterpret_cast<void**>(
+                    g_base + kStaminaRectOff);
+                if (Plausible(white)) {
+                    DrawIconRuns(white, kLeoHeadRuns, kLeoHeadRunCount,
+                                 bdayColX, bdayRowY + 2, 4);
+                }
+            }
+            else if (s_bdayNpc != nullptr && Plausible(s_bdayNpc) &&
+                RangeReadable(s_bdayNpc, 0x58u)) {
+                void* netSprite = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(s_bdayNpc) + 0x50);
+                if (netSprite != nullptr && Plausible(netSprite) &&
+                    RangeReadable(netSprite, 0x70u)) {
+                    void* sprite = *reinterpret_cast<void**>(
+                        reinterpret_cast<unsigned char*>(netSprite) + 0x68);
+                    if (sprite != nullptr && Plausible(sprite) &&
+                        RangeReadable(sprite, 0x18u)) {
+                        void* tex = *reinterpret_cast<void**>(
+                            reinterpret_cast<unsigned char*>(sprite) + 0x10);
+                        void* white = *reinterpret_cast<void**>(
+                            g_base + kStaminaRectOff);
+                        void* mtTex =
+                            (white != nullptr && Plausible(white))
+                                ? *reinterpret_cast<void**>(white) : nullptr;
+                        void* batch = *reinterpret_cast<void**>(
+                            g_base + kGame1SpriteBatchOff);
+                        if (tex != nullptr && mtTex != nullptr &&
+                            Plausible(tex) && Plausible(batch) &&
+                            *reinterpret_cast<void**>(tex) == mtTex) {
+                            NullableRect src;
+                            src.x = 0;
+                            src.y = s_bdayCrop;
+                            src.w = 16;
+                            src.h = 15;
+                            src.present = 1;
+                            for (int q = 0; q < 7; q++) {
+                                src.pad[q] = 0;
+                            }
+                            const int ix = bdayColX;
+                            const int iy = bdayRowY + 2;
+                            const u64 xy =
+                                (static_cast<u64>(static_cast<u32>(iy)) << 32) |
+                                static_cast<u32>(ix);
+                            const u64 wh =
+                                (static_cast<u64>(static_cast<u32>(15 * 4))
+                                 << 32) |
+                                static_cast<u32>(16 * 4);
+                            auto drawSprite =
+                                reinterpret_cast<DrawSpriteFn>(
+                                    g_base + kDrawSpriteOff);
+                            drawSprite(batch, tex, xy, wh, &src, 0xFFFFFFFFu,
+                                       0.0f, 0.0f, 0.0f, 1.0f, 0);
+                        }
+                    }
+                }
+            }
+            DrawHudString(s_bdayLine.obj,
+                          static_cast<float>(bdayColX + 72),
+                          static_cast<float>(bdayRowY + 20), 0xFFFFFFFFu);
         }
 
         /* Tool upgrade countdown: only when something is actually upgrading. */
@@ -18841,7 +19892,8 @@ namespace {
                              kHudToolX, kHudToolY, kHudToolScale);
             }
         }
-        DrawHudString(s_upgradeLine.obj, kHudTextX, kHudToolTextY, 0xFFFFFFFFu);
+        DrawHudString(s_upgradeLine.obj, kHudTextX, kHudToolTextY,
+                      0xFFFFFFFFu);
     }
 
     void HookDrawHud(void* self) {
@@ -18983,17 +20035,6 @@ namespace {
             }
         }
 
-        const int s = *reinterpret_cast<const int*>(g_base + kSeasonOff);
-        const int d = *reinterpret_cast<const int*>(g_base + kDayOfMonthOff);
-        if (s >= 0 && s <= 3 && d >= 1 && d <= 28) {
-            const int today = s * 100 + d;
-            if (g_bdayNotified != today) {
-                /* Marked before the attempt: a failure must not retry every
-                 * frame, and this is the only place that pushes. */
-                g_bdayNotified = today;
-                PushBirthdayToast(FindBirthdayName());
-            }
-        }
         /* v398: drawn BEFORE the game's HUD, not after.  drawHUD is called
          * with a SpriteBatch already begun; whether that batch is still open
          * when it returns is not something this code can see, and drawing into
@@ -19017,6 +20058,11 @@ namespace nn::ro::detail {
 extern "C" void exl_main(void* x0, void* x1) {
     (void)x0;
     (void)x1;
+
+    /* Volatile stores: they keep g_timeRequest alive through --gc-sections
+     * (nothing else references it yet) and put the slot in a known state. */
+    g_timeRequest.seq = 0u;
+    g_timeRequest.target = 600;
 
 #ifdef SDV_DIAG_HANG
     for (;;) {

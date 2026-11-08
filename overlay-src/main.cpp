@@ -1660,6 +1660,90 @@ bool poke(u64 off, const void* data, size_t size) {
     return R_SUCCEEDED(dmntchtWriteCheatProcessMemory(gNsoBase + off, data, size));
 }
 
+// ---------------------------------------------------------------- subsdk8 ---
+//
+// Communication test only: publish a request into the mod's own slot and let
+// the mod read it.  Nothing here touches timeOfDay, the clock or the date.
+//
+// The slot's address was taken from the built module:
+//   aarch64-none-elf-nm -S sdv_native.elf | grep g_timeRequest
+//   000000000003d310 0000000000000008 d g_timeRequest
+// The three NSO segments match the ELF program headers one for one, so the
+// runtime address is module base + 0x3D310.  Re-export if the mod is rebuilt.
+
+constexpr u64 kSubsdkTimeReqOff = 0x3D310ULL;
+// First eight bytes of the mod's text: the branch over the NX header, then
+// __nx_mod0's offset (0x36BA0) and __nx_modver's (0x36BBC).  Both offsets move
+// whenever the module's text changes size, so this has to be re-read from the
+// ELF for every build -- it read 0x38C50 in the previous one, which made the
+// scan fail with "找不到 subsdk8" instead of finding the wrong module.
+//   xxd -l 16 sdv_native.elf at the first LOAD's file offset
+constexpr u8  kSubsdkSig[8] = {0x08, 0x00, 0x00, 0x14, 0xA0, 0x6B, 0x03, 0x00};
+
+u64  gSubsdkBase = 0;
+char gTimeReqStatus[64] = "未测试";
+
+// Scans the mappings for an executable region whose first bytes match the
+// mod's text.  No module list is available through this dmnt struct, so the
+// signature is what identifies the module.
+u64 findSubsdkBase() {
+    if (gSubsdkBase) return gSubsdkBase;
+    u64 total = 0;
+    if (R_FAILED(dmntchtGetCheatProcessMappingCount(&total))) return 0;
+    MemoryInfo chunk[32];
+    u64 off = 0;
+    while (off < total) {
+        u64 got = 0;
+        if (R_FAILED(dmntchtGetCheatProcessMappings(chunk, 32, off, &got)) || !got)
+            break;
+        for (u64 i = 0; i < got; i++) {
+            const MemoryInfo& m = chunk[i];
+            if (!(m.perm & Perm_X)) continue;
+            u8 head[8];
+            if (R_FAILED(dmntchtReadCheatProcessMemory(m.addr, head, sizeof(head))))
+                continue;
+            bool same = true;
+            for (int k = 0; k < 8; k++)
+                if (head[k] != kSubsdkSig[k]) { same = false; break; }
+            if (same) { gSubsdkBase = m.addr; return gSubsdkBase; }
+        }
+        off += got;
+    }
+    return 0;
+}
+
+// Odd/even seqlock: odd seq means "being written", even means "published".
+bool submitTimeRequest(int hhmm) {
+    const u64 base = findSubsdkBase();
+    if (!base) { std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "找不到 subsdk8"); return false; }
+
+    const u64 addr = base + kSubsdkTimeReqOff;
+    u32 seq = 0;
+    if (R_FAILED(dmntchtReadCheatProcessMemory(addr, &seq, sizeof(seq)))) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "读 seq 失败");
+        return false;
+    }
+    const u32 even = (seq + 2u) & ~1u;
+    const u32 odd  = even - 1u;
+    const s32 tgt  = hhmm;
+
+    if (!pokeAbs(addr, &odd, 4)) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(奇) 失败");
+        return false;
+    }
+    if (!pokeAbs(addr + 4, &tgt, 4)) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 target 失败");
+        return false;
+    }
+    if (!pokeAbs(addr, &even, 4)) {
+        std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus), "写 seq(偶) 失败");
+        return false;
+    }
+    std::snprintf(gTimeReqStatus, sizeof(gTimeReqStatus),
+                  "已提交 %d seq %u->%u", hhmm, seq, even);
+    return true;
+}
+
 // peek() adds the module base; a MonoString object lives on the managed heap at
 // an absolute address, so it needs the raw form.
 bool peekAbs(u64 addr, void* out, size_t size) {
@@ -3254,6 +3338,11 @@ public:
         });
         list->addItem(mMin);
 
+        // The "通信测试" row that used to sit here cycled three fixed targets
+        // through the request slot.  It is gone now that the mod executes what
+        // it is handed: leaving it would mean a second way to submit a request,
+        // and a stray press during a test would move the clock.
+
         // Written as its own row so that "change" and "save" are different
         // presses.  Sharing A between them is what made the old page look
         // broken: the press did commit, it just committed an untouched value.
@@ -3376,6 +3465,9 @@ private:
     // compare two numbers on the same row.  Every adjustment goes through
     // here, so a press that changes nothing is impossible to mistake for a
     // press that was not received.
+    //
+    // The day is deliberately not mentioned: this round only sets the clock, and
+    // the day rows never had a resolved field behind them.
     void notePending() {
         char msg[48];
         std::snprintf(msg, sizeof(msg), "待写入 %s %s",
@@ -3383,9 +3475,13 @@ private:
         setStatus(msg);
     }
 
-    // Both writers go through the resolved pair, so the "which layout" answer
-    // lives in one place and a miss is reported as a miss instead of writing a
-    // day number over whatever 0x0C95BEB0 holds on an updated console.
+    // The day writer goes through the resolved pair, so the "which layout"
+    // answer lives in one place and a miss is reported as a miss instead of
+    // writing a day number over whatever 0x0C95BEB0 holds on an updated console.
+    // The day is a plain field write, and stays one: it is the only path the
+    // calendar has here, and it is what this row is used for.  writeClock() is
+    // the one that went away -- the clock now goes through the request slot so
+    // the game's own per-ten-minute updates run.
     bool writeDay(u32 v) {
         const DateFields f = dateFields();
         if (!f.day) {
@@ -3394,16 +3490,6 @@ private:
             return false;
         }
         return writeField(f.day, v);
-    }
-
-    bool writeClock(u32 v) {
-        const DateFields f = dateFields();
-        if (!f.time) {
-            setStatus("找不到时间字段");
-            logError("date: no layout matched, clock write refused");
-            return false;
-        }
-        return writeField(f.time, v);
     }
 
     // A walks forward and wraps: 6, 7, ... 26, 6.  Wrapping rather than
@@ -3462,22 +3548,36 @@ private:
         notePending();
     }
 
-    // One save row for the whole page.  Day and clock are separate fields in
-    // the game, but the player edits them as one "the next in-game moment", so
-    // saving them separately would mean two presses and two chances to forget
-    // the second one.
+    // One save row for the whole page.
+    //
+    // The day is written straight into its field; the clock is not.  Writing
+    // timeOfDay directly leaves the game's per-ten-minute work undone -- the
+    // HUD, the music, the menus, the farmer -- so the clock goes through the
+    // request slot and the mod runs those updates on its own thread.
+    //
+    // The black screen this console got came from the DAY write, not the clock
+    // one: day 28, sleep, the calendar rolls into the 1st of the next month, and
+    // the console dies in the new-day path.  Writing the day is still the only
+    // way to set a date here, so it stays -- but that rollover is a real hazard
+    // and is not fixed by anything in this file.
     bool commitClock() {
+        // Day first, exactly as before: a field write, the only path there is.
         bool ok = true;
-        if (mSeenDay) ok = writeDay(gDay) && ok;   // fields unresolved: skip
-        ok = writeClock(gClock) && ok;
-        if (ok) {
-            char msg[32];
-            std::snprintf(msg, sizeof(msg), "已写入 %s %s",
-                          dayText(gDay).c_str(), clockText(gClock).c_str());
+        if (mSeenDay) {
+            ok = writeDay(gDay) && ok;
+        }
+        const u32 v = gClock;
+        const u32 minute = v % 100;
+        if (v < 600 || v > 2550 || minute >= 60 || (minute % 10) != 0) {
+            char msg[48];
+            std::snprintf(msg, sizeof(msg), "目标非法 %s", clockText(v).c_str());
             setStatus(msg);
-            // Show what the game now reports rather than what we asked for.
-            pollSeen();
-            if (mCur) mCur->setValue(curText());
+            return true;
+        }
+        if (submitTimeRequest((int)v) && ok) {
+            char msg[48];
+            std::snprintf(msg, sizeof(msg), "已写入 %s", clockText(v).c_str());
+            setStatus(msg);
         }
         return true;
     }
