@@ -697,7 +697,7 @@ namespace {
      * while the game is running (including across menu opens) and start ON
      * again after a restart.  That is the honest trade: a switch is not worth
      * a hidden cursor or a hang. */
-    constexpr int kRowCount = 12;
+    constexpr int kRowCount = 13;
     constexpr int kRowMap = 1;
     constexpr int kRowMaster = 2;
     constexpr int kRowFirstSub = 3;
@@ -712,6 +712,11 @@ namespace {
     constexpr int kRowPlant = 10;
     /* v372: automation on/off.  Top-level row, after the tractor group. */
     constexpr int kRowAutomate = 11;
+    /* v426: the whole top-left block on/off (weather, luck, birthday, tool).
+     * Not in the row mask (bits 1..11 are taken); it rides in bit 12 of the
+     * same preferences int, as an "off" flag so values written before this
+     * build keep the HUD on. */
+    constexpr int kRowHud = 12;
     /* v314: THE WHOLE BITMAP LIVES IN ONE INT FIELD.
      *
      * Borrowing one bool per switch is what broke v312: two of the ten were
@@ -743,6 +748,14 @@ namespace {
     constexpr uintptr_t kOptListGrowOff = SDV_OFF(kOptListGrowOff, 0x1711430u);
     constexpr unsigned kMaskTag = 0x4000u;
     constexpr unsigned kMaskBits = 0xFFEu;   /* bits 1..11 */
+    /* v427: the HUD switch rides in bit 12 of the same int.  bit 14 is the tag
+     * and bits 1..11 are the row mask, so 12, 13 and 15 are the only free ones,
+     * and this is the int that actually reaches the preferences file -- which
+     * is what makes the other eleven survive a restart.
+     *
+     * The bit means HUD OFF: a value written before this build has it clear, so
+     * updating does not make the HUD vanish for anyone with switches saved. */
+    constexpr unsigned kMaskHudOffBit = 0x1000u;
     static unsigned s_fileMask = kMaskBits;
     static unsigned s_fileMaskOk = 0;
     /* v385: serialisation-chain diagnostic (read-only). */
@@ -759,12 +772,54 @@ namespace {
     /* The value to inject into the SERIALISED copy at save time: the live
      * Options is not the object the serializer reads. */
     static unsigned g_savedMask = kMaskTag | kMaskBits;
+    /* v429: save safety gate.  True only once this session has obtained a mask
+     * from a source that passed its own validation -- currently that means
+     * ApplyDisconnectDayMask read a field carrying the marker and the must-zero
+     * bits.  While false, TryPerformSave leaves Options+0x70 alone instead of
+     * writing the initialiser (all-on) over whatever the file already holds.
+     *
+     * It is deliberately NOT set by "the function ran", by a page build, or by
+     * the absence of a marker: a missing marker and a corrupted one are
+     * indistinguishable here, and a corrupted one may still be the player's
+     * real configuration. */
+    static bool g_maskReady = false;
+    /* Read-only: how many saves went past the injection point while the gate
+     * was closed.  Zero means the window never opened in this session. */
+    static unsigned s_saveSkipped = 0;
+    /* Probe A state.  Deliberately holds TEXT, not the object pointer: our data
+     * segment is not a GC root, so parking the pointer here would neither keep
+     * the object alive nor be honest about it.  The pointer lives in a stack
+     * local for the duration of the probe and is formatted into this string. */
+    static unsigned s_probeA = 0;
+    static unsigned s_probeWait = 0;   /* frames since arming */
+    /* Armed by the first switch change.  A timer from boot would save the mask
+     * the file already holds, which proves nothing -- the point is to save a
+     * change that has NOT been through a farm save. */
+    static unsigned s_probeArm = 0;
+    static char s_probeAText[96] = "ps=0";
+    /* v431 experiment: how many times the staged mask was also put into the
+     * live Options.  Read-only. */
+    static unsigned s_liveWrites = 0;
     /* v379: frames since the last save request we issued for a switch change. */
     static unsigned s_saveAskFrame = 300u;
     /* v382: a switch changed; one save request goes out 2 s later. */
     static unsigned s_maskDirty = 0;
     static unsigned s_maskFrame = 0;
-    static unsigned char s_rowPrev[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    /* Audit counter: how many times the draw hook saw a row differ from
+     * s_rowPrev.  A steady +1 per frame means something is fighting the
+     * checkbox and the "changed" test has degenerated into "always". */
+    static unsigned s_changedCount = 0;
+    /* Round 6 stage 2, read-only.  These describe the disconnectDay channel:
+     * whether the flush landed, what the field decodes to, and how many rows
+     * the once-a-second read would have overwritten with a different value. */
+    static unsigned s_flushOk = 0;      /* last WriteDisconnectDay result */
+    static unsigned s_flushCount = 0;
+    static unsigned s_flushFail = 0;
+    static unsigned s_discMaskLast = 0; /* last decoded mask */
+    static unsigned s_applyCount = 0;
+    static unsigned s_applyDiffer = 0;  /* rows that differed at the last read */
+    static unsigned s_applyBefore = 0;  /* g_rowOn[1..11] as a mask, pre-apply */
+    static unsigned char s_rowPrev[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static unsigned s_rowPrevInit = 0;
     static unsigned s_rowsApplied = 0;
     static void* g_ourElems[kRowCount] = {};
@@ -800,12 +855,18 @@ namespace {
     static int g_listCap = 0;
     /* Per-row state, read straight out of +0x51 each frame.  Rows 1..10 are
      * seeded from the file at boot; row 0 is the game's own option. */
-    static unsigned g_rowOn[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    static unsigned g_rowOn[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static void* g_ourElem = nullptr;   /* row 0, the HUD readout reads this */
     /* Mirror of g_rowOn[kRowMaster], used by every tractor hook. */
     static unsigned g_tractorOn = 1;
     /* Mirror of g_rowOn[kRowMap], used by the map draw hook. */
     static unsigned g_mapOn = 1;
+    /* Mirror of g_rowOn[kRowHud], used by the HUD build and draw. */
+    static unsigned g_hudOn = 1;
+    /* The persisted HUD flag, out of bit 12 of the same preferences int the row
+     * mask uses.  Kept next to s_fileMask for the page build, which needs the
+     * value without re-reading the field. */
+    static unsigned s_discHud = 1;
     /* Stage 185: the checkbox state is stored in the game's own Options
      * object instead of a file.
      *
@@ -2222,6 +2283,29 @@ namespace {
      * s_eventActive answers the first half on sight. */
     static unsigned s_eventActive = 0;
     constexpr uintptr_t kGetCurrentEventOff = SDV_OFF(kGetCurrentEventOff, 0x1442C10u);
+    /* Stage-1 probe A: construct one StartupPreferences and read its +0x50.
+     * Off in release; this exists only to prove the constructor's allocation
+     * semantics on hardware before anything is loaded or saved. */
+#ifdef SDV_RELEASE
+    constexpr bool kStartupPrefsProbe = false;
+#else
+    /* Probe D is off.  It ran once on hardware, reached pd=3 (savePreferences
+     * returned), and the next boot crashed while loading the save.  Until that
+     * is explained the probe must not be able to fire again -- with it compiled
+     * in, the next switch toggle would repeat the same write. */
+    constexpr bool kStartupPrefsProbe = false;
+#endif
+    constexpr uintptr_t kStartupPrefsCtorOff =
+        SDV_OFF(kStartupPrefsCtorOff, 0x1ADE8C0u);
+    /* loadPreferences(bool, bool, bool) -- three bools in the target build. */
+    constexpr uintptr_t kStartupPrefsLoadOff =
+        SDV_OFF(kStartupPrefsLoadOff, 0x1ADF4A0u);
+    /* Game1.get_options() -- static getter, returns the live Options. */
+    constexpr uintptr_t kGame1GetOptionsOff =
+        SDV_OFF(kGame1GetOptionsOff, 0x1443520u);
+    /* savePreferences(bool async, bool update_language) -- two bools. */
+    constexpr uintptr_t kStartupPrefsSaveOff =
+        SDV_OFF(kStartupPrefsSaveOff, 0x1ADEE90u);
     constexpr uintptr_t kSpeedConstWord0Off = SDV_OFF(kSpeedConstWord0Off, 0x13DA0BCu);
     constexpr uintptr_t kSpeedConstWord1Off = SDV_OFF(kSpeedConstWord1Off, 0x13DA0C0u);
 
@@ -11163,9 +11247,10 @@ namespace {
                         u"\u3000\u6324\u5976\u526A\u6BDB",        /* 　挤奶剪毛  */
                         u"\u3000\u64AD\u79CD\u65BD\u80A5",        /* 　播种施肥  */
                         u"\u542F\u7528\u81EA\u52A8\u5316",        /* 启用自动化  */
+                        u"\u5DE6\u4E0A\u89D2\u4FE1\u606F",        /* 左上角信息  */
                     };
                     static const int kRowLen[kRowCount] =
-                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5};
+                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5};
                     /* Row 0 keeps the game's own `which` (35 -> +0x24), so the
                      * animation flag keeps working exactly as it always has.
                      * Every other row gets the sentinel: the click writes
@@ -11174,16 +11259,19 @@ namespace {
                     static const int kRowWhich[kRowCount] = {
                         35, kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                         kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
-                        kOptIndex2, kOptIndex2, kOptIndex2,
+                        kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                     };
                     if (s_rowsApplied == 0) {
                         if (s_fileMaskOk != 0) {
                             for (int i = 1; i < kRowCount; i++) {
                                 g_rowOn[i] = (s_fileMask >> i) & 1u;
                             }
-                            g_savedMask = kMaskTag | s_fileMask;
+                            g_savedMask = kMaskTag | s_fileMask |
+                                          (s_discHud == 0 ? kMaskHudOffBit : 0u);
                             g_tractorOn = g_rowOn[kRowMaster];
                             g_mapOn = g_rowOn[kRowMap];
+                            g_rowOn[kRowHud] = s_discHud;
+                            g_hudOn = s_discHud;
                         }
                         s_rowsApplied = 1;
                     }
@@ -11567,6 +11655,10 @@ namespace {
          * readout proved that: 12 rows, capacity grown), and then the shrink set
          * the size back to 11, cutting it off.  Every new row must be listed. */
         order[n++] = kRowAutomate;
+        /* v426: same trap the comment above describes, one row later.  The
+         * append loop put the HUD row in the list; this list is what the shrink
+         * keeps, so leaving it out cuts the row off again. */
+        order[n++] = kRowHud;
         return n;
     }
 
@@ -13303,7 +13395,20 @@ namespace {
      * the field's untouched default 0xFEFFFEFF has bit 14 set, which decoded
      * to mask 0xEFE and silently switched row 8 (打怪) off. */
     constexpr unsigned kDiscMark     = 0x005A0000u;  /* byte 2 */
-    constexpr unsigned kDiscMarkMask = 0x00FF0000u;
+    /* v426 put the HUD switch in bit 16 of this byte; v427 moved it to bit 12
+     * of the preferences int, because this field only reaches the disk with a
+     * farm save.  The bit is not written any more, and the marker test still
+     * ignores it (kDiscMarkMask covers bits 17..23) so a value written by the
+     * previous build keeps passing -- narrowing the mask back would make those
+     * saves look foreign and reset every switch once. */
+    constexpr unsigned kDiscMarkMask = 0x00FE0000u;
+    /* v430: the HUD switch rides in bit 24 -- byte 3 of the value, which the
+     * marker test ignores (bits 17..23) and the must-zero test ignores (bit 0
+     * and bits 12..15).  It is the only carrier that has actually been proved
+     * to survive a save: the preferences int never supplied a mask, which is
+     * why the HUD row kept coming back on.  Set means HUD OFF, so a value
+     * written before this build still reads as "on". */
+    constexpr unsigned kDiscHudOffBit = 0x01000000u;
     constexpr unsigned kDiscMaskBits = 0x0FFEu;      /* bits 1..11 */
     constexpr unsigned kDiscMustZero = 0xF001u;      /* bit 0 + bits 12..15 */
 
@@ -13365,21 +13470,21 @@ namespace {
      * Writing all three the way the real setter does makes the interpolator
      * converge on our number instead of away from it.  Plain 32-bit stores, no
      * managed call, so this is still safe from the draw hook. */
-    void WriteDisconnectDay(unsigned value) {
+    bool WriteDisconnectDay(unsigned value) {
         void* pl = CarryPlayer();
         if (pl == nullptr) {
-            return;
+            return false;
         }
         /* Wrapper base: NetValueSlot already validated owner+off and the
          * wrapper's value slot, so base+0x68 is the slot it returned. */
         void* slot = NetValueSlot(pl, kFarmerDiscDayOff, 4u);
         if (slot == nullptr) {
-            return;
+            return false;
         }
         unsigned char* base =
             reinterpret_cast<unsigned char*>(slot) - kNetValueOff;
         if (!RangeReadable(base + 0x68u, 0xCu)) {
-            return;
+            return false;
         }
         /* v392: all three copies get the SAME number.
          *
@@ -13393,6 +13498,7 @@ namespace {
         *reinterpret_cast<unsigned*>(base + 0x68u) = value;  /* value      */
         *reinterpret_cast<unsigned*>(base + 0x6Cu) = value;  /* previous   */
         *reinterpret_cast<unsigned*>(base + 0x70u) = value;  /* target     */
+        return true;
     }
 
     /* If disconnectDay carries our marker, extract the mask and apply it. */
@@ -13409,24 +13515,82 @@ namespace {
             return;
         }
         unsigned mask = v & kDiscMaskBits;
+        /* HUD bit out of byte 3, same encoding as the write below: set = off.
+         * Must happen before the g_savedMask sync so the staged value carries
+         * it, and before g_rowOn[kRowHud] is restored further down. */
+        s_discHud = (v & kDiscHudOffBit) != 0u ? 0u : 1u;
+        /* Audit: how many rows this pass is about to change.  Non-zero means
+         * the field disagreed with what the UI had -- i.e. the second writer
+         * fired with a different value, which is the condition for the
+         * per-frame churn described in docs/REGRESSION_AUDIT.md. */
+        {
+            unsigned differ = 0;
+            unsigned before = 0;
+            for (int i = 1; i < kRowCount; i++) {
+                if (i == kRowHud) {
+                    continue;
+                }
+                if (g_rowOn[i] != 0) {
+                    before |= (1u << i);
+                }
+                if (g_rowOn[i] != ((mask >> i) & 1u)) {
+                    ++differ;
+                }
+            }
+            s_applyBefore = before;   /* what the UI had, before this pass */
+            s_applyDiffer = differ;   /* rows this pass is about to change */
+            ++s_applyCount;
+        }
+        s_discMaskLast = mask;
         s_fileMask = mask;
         s_fileMaskOk = 2;    /* 2 = from disconnectDay, not preferences */
+        /* v428 (P0-b): the staged value has to follow the source that was just
+         * validated.  Without this, a session whose mask comes from
+         * disconnectDay leaves g_savedMask at its initialiser -- the all-on
+         * mask -- and the next save writes that back over the real state.
+         * Hardware showed exactly that split: M=7fe, dm=7fe, S=ffe.
+         *
+         * Only reached after the marker test and the decode both passed, so a
+         * missing or foreign field never gets promoted to "the user's config".
+         * s_discHud was just decoded from byte 3 of the same value, so the
+         * staged mask carries the HUD bit in its own encoding (bit 12). */
+        g_savedMask = kMaskTag | mask |
+                      (s_discHud == 0 ? kMaskHudOffBit : 0u);
+        /* Reached only after the marker test and the must-zero test both
+         * passed, so this is trusted data, not "the function executed". */
+        g_maskReady = true;
         for (int i = 1; i < kRowCount; i++) {
             g_rowOn[i] = (mask >> i) & 1u;
         }
+        /* The loop above walks all thirteen rows and bit 12 of `mask` is always
+         * clear, so it would switch the HUD row off once a second.  The value
+         * that belongs there is the one decoded a few lines up (byte 3). */
+        g_rowOn[kRowHud] = s_discHud;
         g_tractorOn = g_rowOn[kRowMaster];
         g_mapOn = g_rowOn[kRowMap];
+        g_hudOn = g_rowOn[kRowHud];
     }
 
     /* Write the current switch state into disconnectDay. */
     void FlushMaskToDisconnectDay() {
         unsigned m = 0;
         for (int i = 1; i < kRowCount; i++) {
+            if (i == kRowHud) {
+                continue;   /* carried in bit 24 below, not in this mask */
+            }
             if (g_rowOn[i] != 0) {
                 m |= (1u << i);
             }
         }
-        WriteDisconnectDay(kDiscMark | (m & kDiscMaskBits));
+        const bool ok = WriteDisconnectDay(
+            kDiscMark |
+            (g_rowOn[kRowHud] == 0 ? kDiscHudOffBit : 0u) |
+            (m & kDiscMaskBits));
+        s_flushOk = ok ? 1u : 0u;
+        ++s_flushCount;
+        if (!ok) {
+            ++s_flushFail;
+        }
     }
 
     constexpr uintptr_t kCharTileXOff     = SDV_OFF(kCharTileXOff,    0x1224440u);
@@ -17174,7 +17338,7 @@ namespace {
                 != nullptr ? 1u : 0u;
         /* v410: same reason -- get_DailyLuck is managed, so the number is
          * taken here (once a second) and the HUD only draws the copy. */
-        if (kHudInfo) {
+        if (kHudInfo && g_hudOn != 0) {
             SampleDailyLuck();
             /* Once a second is enough to notice an upgrade starting, but the
              * moment one does the row is drawn immediately while the icon is
@@ -17206,6 +17370,78 @@ namespace {
                 RunWeatherProbe();
             }
             BuildHudStrings();
+        }
+        /* Probe A (one shot, never retried): allocate and construct a
+         * StartupPreferences, read its +0x50, then drop the reference.
+         *
+         * Nothing else is called -- no loadPreferences, no savePreferences, no
+         * Game1.get_options.  The pointer stays in this frame; only numbers are
+         * copied out, so the collector is free to reclaim the object. */
+        if (kStartupPrefsProbe && s_probeA == 0 && s_probeArm != 0) {
+            if (CarryPlayer() == nullptr || s_eventActive != 0) {
+                s_probeWait = 0;                 /* wait for a quiet moment */
+            }
+            else if (++s_probeWait >= 180) {     /* ~3 s after the change */
+                s_probeA = 1;
+                void* prefs = reinterpret_cast<void* (*)(void*)>(
+                    g_base + kStartupPrefsCtorOff)(nullptr);
+                unsigned char* pb = reinterpret_cast<unsigned char*>(prefs);
+                if (prefs == nullptr || !RangeReadable(pb + 0x59u, 1u) ||
+                    !RangeReadable(pb + 0x50u, 8u)) {
+                    s_probeA = 4u;
+                    snprintf(s_probeAText, sizeof(s_probeAText), "pd=4 p=%llx",
+                             static_cast<unsigned long long>(
+                                 reinterpret_cast<uintptr_t>(prefs)));
+                }
+                else if (*reinterpret_cast<unsigned char*>(pb + 0x59u) != 0u) {
+                    /* _isBusy.  On a fresh object this is always 0 -- it is a
+                     * per-instance flag, so it cannot see a save running on the
+                     * game's own instance.  Kept because the task asked for it. */
+                    s_probeA = 6u;
+                    snprintf(s_probeAText, sizeof(s_probeAText), "pd=6 busy=1");
+                }
+                else {
+                    reinterpret_cast<void (*)(void*, int, int, int)>(
+                        g_base + kStartupPrefsLoadOff)(prefs, 0, 0, 0);
+                    void* gopt = reinterpret_cast<void* (*)(void*)>(
+                        g_base + kGame1GetOptionsOff)(nullptr);
+                    void* after = nullptr;
+                    if (gopt != nullptr) {
+                        *reinterpret_cast<void**>(pb + 0x50u) = gopt;
+                        asm volatile("" ::: "memory");
+                        after = *reinterpret_cast<void**>(pb + 0x50u);
+                    }
+                    if (gopt == nullptr || after != gopt) {
+                        s_probeA = 5u;
+                        snprintf(s_probeAText, sizeof(s_probeAText),
+                                 "pd=5 g=%llx a=%llx",
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(gopt)),
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(after)));
+                    }
+                    else {
+                        /* Everything validated.  Mark ps=2, then this is the
+                         * last side-effecting call in the probe. */
+                        s_probeA = 2u;
+                        snprintf(s_probeAText, sizeof(s_probeAText),
+                                 "pd=2 g=%llx a=%llx",
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(gopt)),
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(after)));
+                        reinterpret_cast<void (*)(void*, int, int)>(
+                            g_base + kStartupPrefsSaveOff)(prefs, 0, 0);
+                        s_probeA = 3u;
+                        snprintf(s_probeAText, sizeof(s_probeAText),
+                                 "pd=3 g=%llx a=%llx",
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(gopt)),
+                                 static_cast<unsigned long long>(
+                                     reinterpret_cast<uintptr_t>(after)));
+                    }
+                }
+            }
         }
         /* Round 6: the request runs before the original _update, so the frame's
          * own clock update still happens afterwards.  Everything it needs is
@@ -17389,10 +17625,14 @@ namespace {
                     if ((v & kMaskTag) != 0) {
                         s_fileMask = v & kMaskBits;
                         s_fileMaskOk = 1;
-                        g_savedMask = kMaskTag | s_fileMask;
+                        s_discHud = (v & kMaskHudOffBit) != 0u ? 0u : 1u;
+                        g_savedMask = kMaskTag | s_fileMask |
+                                      (s_discHud == 0 ? kMaskHudOffBit : 0u);
                         for (int i = 1; i < kRowCount; i++) {
                             g_rowOn[i] = (s_fileMask >> i) & 1u;
                         }
+                        g_rowOn[kRowHud] = s_discHud;
+                        g_hudOn = s_discHud;
                         g_tractorOn = g_rowOn[kRowMaster];
                         g_mapOn = g_rowOn[kRowMap];
                     }
@@ -17522,6 +17762,7 @@ namespace {
             }
             g_tractorOn = g_rowOn[kRowMaster];
             g_mapOn = g_rowOn[kRowMap];
+            g_hudOn = g_rowOn[kRowHud];
 
             /* Stage the values TryPerformSave injects into the serialised copy.
              *
@@ -17545,16 +17786,51 @@ namespace {
                     }
                 }
                 if (changed) {
+                    ++s_changedCount;
+                    s_probeArm = 1;      /* probe D: save this change */
                     for (unsigned i = 0; i < kRowCount; i++) {
                         s_rowPrev[i] = static_cast<unsigned char>(g_rowOn[i]);
                     }
+                    /* s_discHud is the copy the page build reads; a toggle has
+                     * to move it too or the next rebuild would resurrect the
+                     * value from boot. */
+                    s_discHud = g_rowOn[kRowHud];
                     unsigned m = 0;
                     for (int i = 1; i < kRowCount; i++) {
+                        /* kRowHud is deliberately not in the mask: bit 12 is
+                         * outside both kMaskBits and kDiscMaskBits, and a bit
+                         * the loader does not know about would fail the
+                         * "is this ours" test and reset every other switch. */
+                        if (i == kRowHud) {
+                            continue;
+                        }
                         if (g_rowOn[i] != 0) {
                             m |= (1u << i);
                         }
                     }
-                    g_savedMask = kMaskTag | m;
+                    /* v427: the HUD flag goes into the same int.  Without it
+                     * the only carrier was disconnectDay, which rides the FARM
+                     * save -- so quitting and restarting (no sleep) lost it,
+                     * while the other eleven survived through preferences. */
+                    g_savedMask = kMaskTag | m |
+                                  (g_rowOn[kRowHud] == 0 ? kMaskHudOffBit : 0u);
+                    /* v431 experiment: also put it into the LIVE Options, with
+                     * a plain 4-byte store -- no managed call, nothing that can
+                     * deadlock.  TryPerformSave only runs at a farm save, so
+                     * until now a quit without sleeping carried the old value.
+                     * If the game writes preferences when the app closes, this
+                     * is all it takes for a toggle to survive that. */
+                    if (g_options != nullptr && Plausible(g_options) &&
+                        RangeReadable(reinterpret_cast<unsigned char*>(g_options) +
+                                          kMaskOff, 4u)) {
+                        unsigned char* lo =
+                            reinterpret_cast<unsigned char*>(g_options) + kMaskOff;
+                        for (int b = 0; b < 4; b++) {
+                            lo[b] = static_cast<unsigned char>(
+                                (g_savedMask >> (8 * b)) & 0xFFu);
+                        }
+                        ++s_liveWrites;
+                    }
                     /* v392: hand the write to HookGameUpdate.  This is a render
                      * hook; CarryPlayer() is a managed getter and calling one
                      * from here is the exact pattern that froze the console
@@ -17823,6 +18099,16 @@ namespace {
      * every frame.  The call is asynchronous as well, so even the queueing
      * cost stays out of the render thread. */
     void TryPerformSave() {
+        /* Stop-loss after probe D: disabling kStartupPrefsProbe only removes
+         * the new one-shot caller.  Legacy callers (including the HUD path)
+         * can still reach this function and request savePreferences.  Stop
+         * before any object construction, Options write, or platform save.
+         * Normal farm saves and disconnectDay synchronization do not use this
+         * Mod-requested save function and remain unchanged. */
+        constexpr bool kAllowModRequestedPreferencesSave = false;
+        if (!kAllowModRequestedPreferencesSave) {
+            return;
+        }
         if (!g_saveWanted) {
             return;
         }
@@ -17948,10 +18234,21 @@ namespace {
                 cs[kOptFlagOff] = g_savedFlag;
                 /* v314: and the switch bitmap, for exactly the same reason the
                  * flag above is written here and not left to the live object:
-                 * this IS the copy the serializer reads. */
-                for (int b = 0; b < 4; b++) {
-                    cs[kMaskOff + b] =
-                        static_cast<unsigned char>((g_savedMask >> (8 * b)) & 0xFFu);
+                 * this IS the copy the serializer reads.
+                 *
+                 * v429: gated.  Until a validated mask exists this session, the
+                 * field is left exactly as the game loaded it -- writing the
+                 * all-on initialiser here is what could overwrite a real
+                 * configuration that we simply had not read yet.  The dirty
+                 * flag below is untouched, so the game's own save is unaffected. */
+                if (g_maskReady) {
+                    for (int b = 0; b < 4; b++) {
+                        cs[kMaskOff + b] =
+                            static_cast<unsigned char>((g_savedMask >> (8 * b)) & 0xFFu);
+                    }
+                }
+                else {
+                    ++s_saveSkipped;
                 }
                 cs[kOptDirtyOff] = 1;
                 s_serBit = cs[kOptFlagOff];
@@ -18432,7 +18729,7 @@ namespace {
     int   s_wxStable = 0;
     void* s_wxLastPtr = nullptr;
     /* Diagnostic block: one line per item, built in the update hook. */
-    constexpr int kDiagLines = 10;
+    constexpr int kDiagLines = 13;
     CachedStr s_diag[kDiagLines]{};
 
     /* Phase-3 probe result.  Filled in the update hook, formatted into
@@ -19390,7 +19687,7 @@ namespace {
      * returned a fresh LocationWeather whose WeatherForTomorrow is the default
      * "Sun", so the row went back to always saying 晴. */
     void BuildHudStrings() {
-        if (!kHudInfo) {
+        if (!kHudInfo || g_hudOn == 0) {
             return;
         }
 
@@ -19520,6 +19817,34 @@ namespace {
                          s_exec.before, s_exec.after, s_exec.calls);
             }
             DiagLine(9, tmp);
+            /* Persistence audit (round 6 revision, read-only).
+             *   R   readSettings has run this session
+             *   K   mask source: 0 none, 1 file, 2 disconnectDay
+             *   M   mask read out of the file
+             *   S   mask staged for the next save
+             *   D/F s_maskDirty / s_maskFrame -- both write-only, see docs
+             *   H   g_rowOn[kRowHud]      DH  s_discHud
+             *   cn  how many times "changed" fired this session */
+            snprintf(tmp, sizeof(tmp),
+                     "R=%d K=%d M=%03x S=%03x D=%d F=%d H=%d DH=%d cn=%u",
+                     (s_evtRead != 0xFFu) ? 1 : 0, s_fileMaskOk & 0xFu,
+                     s_fileMask & 0xFFFu, g_savedMask & 0xFFFu,
+                     s_maskDirty, s_maskFrame, g_rowOn[kRowHud], s_discHud,
+                     s_changedCount);
+            DiagLine(10, tmp);
+            /* disconnectDay channel (round 6 stage 2, read-only).
+             *   fl  last WriteDisconnectDay result (1 landed, 0 refused)
+             *   c<n>!<m>  flush count / failure count
+             *   dm  mask decoded out of the field by the last Apply
+             *   ap  how many times Apply ran
+             *   df  rows the last Apply was about to change (0 = agreement) */
+            snprintf(tmp, sizeof(tmp),
+                     "fl=%d c%u!%u bm=%03x dm=%03x ap=%u df=%u g=%d sk=%u lw=%u",
+                     s_flushOk, s_flushCount, s_flushFail, s_applyBefore,
+                     s_discMaskLast, s_applyCount, s_applyDiffer,
+                     g_maskReady ? 1 : 0, s_saveSkipped, s_liveWrites);
+            DiagLine(11, tmp);
+            DiagLine(12, s_probeAText);
         }
 
         /* Birthday: today's first, then tomorrow's.  One row, no icon.
@@ -19691,7 +20016,7 @@ namespace {
     }
 
     void DrawHudInfo() {
-        if (!kHudInfo) {
+        if (!kHudInfo || g_hudOn == 0) {
             return;
         }
         /* Nothing here may allocate: every string below was built in the
