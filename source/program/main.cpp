@@ -36,7 +36,11 @@
 #include "lib/util/sys/rw_pages.hpp"
 #include "program/birthday_table.hpp"
 #include "program/npc_names_cn.hpp"
+#include "program/gift_table.hpp"
 #include "program/npc_crop_table.hpp"
+#include "program/crop_table.hpp"
+#include "program/machine_table.hpp"
+#include "program/preserve_table.hpp"
 #include "program/worldmap_table.hpp"
 #include "program/tooltip_rect_table.hpp"
 #include "program/weather_icons.hpp"
@@ -106,6 +110,10 @@ namespace {
     constexpr uintptr_t kLoadTextureOff = SDV_OFF(kLoadTextureOff, 0x1193200);
     constexpr uintptr_t kGame1ContentOff = SDV_OFF(kGame1ContentOff, 0xC95BA80);
     constexpr uintptr_t kObjectSheetOff = SDV_OFF(kObjectSheetOff, 0xC95BBE0);
+    /* v458: Game1.objectSpriteSheet_2 ("TileSheets/Objects_2").  Wine, juice,
+     * jelly and pickles live here, which is why they had no icon: their
+     * SpriteIndex addresses this sheet, not the standard one. */
+    constexpr uintptr_t kObjectSheet2Off = SDV_OFF(kObjectSheet2Off, 0xC95BCA8);
 
     /* Draw(Texture2D, Rectangle dest, Rectangle source, Color) -- 0xC17E0. */
     /* Draw(Texture2D, Rectangle dest, NullableRectangle* source, Color).
@@ -594,6 +602,13 @@ namespace {
      *  91 = full behaviour + the compact diagnostic rows (see below)
      * Retail crashes when the map page opens, so this lets one build decide
      * whether the hooked function is wrong or our marker code is. */
+    /* Internal build number, printed on the diagnostic row.
+     *
+     * Bumped by hand with every archived build, because the only way to tell
+     * which file is actually running is to look at the screen -- and twice now
+     * a screenshot turned out to be an older build than the one that had just
+     * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
+    constexpr int kBuildNo = 469;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -697,7 +712,16 @@ namespace {
      * while the game is running (including across menu opens) and start ON
      * again after a restart.  That is the honest trade: a switch is not worth
      * a hidden cursor or a hang. */
-    constexpr int kRowCount = 13;
+    /* Master switch for the gift hint: the HUD line and the calendar / social
+     * tooltips.  Kept so a suspected crash can be bisected in ONE boot -- with
+     * this false the module still installs every other hook and never touches
+     * the gift table at all.
+     *
+     * `static const`, not `constexpr`: a compile-time false folds the branches
+     * away, the hook functions become unreferenced and -Werror=unused-function
+     * fails the build.  (Same trap as kTractorActive.) */
+    static const bool kGiftHint = true;
+    constexpr int kRowCount = 15;
     constexpr int kRowMap = 1;
     constexpr int kRowMaster = 2;
     constexpr int kRowFirstSub = 3;
@@ -717,6 +741,20 @@ namespace {
      * same preferences int, as an "off" flag so values written before this
      * build keep the HUD on. */
     constexpr int kRowHud = 12;
+    /* v446: 礼物口味提示 on/off -- the HUD 最爱 row, the calendar tooltip and
+     * the social page tooltip, all three from one switch.
+     *
+     * Same encoding as the HUD row: the bit means OFF.  A mask written by an
+     * earlier build has it clear, so updating does not silently turn the
+     * feature off for anyone with switches already saved -- which is exactly
+     * what a plain "bit 13 = on" row would have done. */
+    constexpr int kRowGift = 13;
+    /* v453: 作物/机器提示 on/off -- one switch for both tile bubbles (the
+     * crop's growth and the machine's timer; v457 renamed the row and put the
+     * machine bubble under it too).  Same "set = OFF" encoding as the HUD and
+     * gift rows, one bit higher in both carriers (preferences bit 15,
+     * disconnectDay bit 26) so a save written by an earlier build reads as on. */
+    constexpr int kRowCrop = 14;
     /* v314: THE WHOLE BITMAP LIVES IN ONE INT FIELD.
      *
      * Borrowing one bool per switch is what broke v312: two of the ten were
@@ -748,6 +786,16 @@ namespace {
     constexpr uintptr_t kOptListGrowOff = SDV_OFF(kOptListGrowOff, 0x1711430u);
     constexpr unsigned kMaskTag = 0x4000u;
     constexpr unsigned kMaskBits = 0xFFEu;   /* bits 1..11 */
+    /* v469: 动画加速2倍 (row 0) rides in bit 0, the one bit of this int that
+     * was still free (14 = tag, 1..11 = rows, 12 HUD, 13 gift, 15 crop).
+     *
+     * It needs a carrier at all because row 0 is the game's own option: its
+     * state lives in Options+0x24 and reaches the disk only through
+     * startup_preferences -- the file this mod stopped writing in v427.  So
+     * the box came back ticked after every restart while the other rows, which
+     * ride the farm save, survived.  Set = OFF, so a value written before this
+     * build reads as "on" and nobody loses 2x speed on update. */
+    constexpr unsigned kMaskAnimOffBit = 0x0001u;
     /* v427: the HUD switch rides in bit 12 of the same int.  bit 14 is the tag
      * and bits 1..11 are the row mask, so 12, 13 and 15 are the only free ones,
      * and this is the int that actually reaches the preferences file -- which
@@ -756,6 +804,12 @@ namespace {
      * The bit means HUD OFF: a value written before this build has it clear, so
      * updating does not make the HUD vanish for anyone with switches saved. */
     constexpr unsigned kMaskHudOffBit = 0x1000u;
+    /* v446: the gift switch rides in bit 13.  bit 14 is the tag and bits 1..11
+     * are the row mask, so 13 and 15 are the only free ones left. */
+    constexpr unsigned kMaskGiftOffBit = 0x2000u;
+    /* v453: the crop-label switch, bit 15 -- the last free bit of this int
+     * (14 is the tag, 1..11 the row mask, 12 HUD, 13 gift). */
+    constexpr unsigned kMaskCropOffBit = 0x8000u;
     static unsigned s_fileMask = kMaskBits;
     static unsigned s_fileMaskOk = 0;
     /* v385: serialisation-chain diagnostic (read-only). */
@@ -819,7 +873,8 @@ namespace {
     static unsigned s_applyCount = 0;
     static unsigned s_applyDiffer = 0;  /* rows that differed at the last read */
     static unsigned s_applyBefore = 0;  /* g_rowOn[1..11] as a mask, pre-apply */
-    static unsigned char s_rowPrev[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    static unsigned char s_rowPrev[kRowCount] =
+        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static unsigned s_rowPrevInit = 0;
     static unsigned s_rowsApplied = 0;
     static void* g_ourElems[kRowCount] = {};
@@ -855,7 +910,8 @@ namespace {
     static int g_listCap = 0;
     /* Per-row state, read straight out of +0x51 each frame.  Rows 1..10 are
      * seeded from the file at boot; row 0 is the game's own option. */
-    static unsigned g_rowOn[kRowCount] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    static unsigned g_rowOn[kRowCount] =
+        {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
     static void* g_ourElem = nullptr;   /* row 0, the HUD readout reads this */
     /* Mirror of g_rowOn[kRowMaster], used by every tractor hook. */
     static unsigned g_tractorOn = 1;
@@ -863,10 +919,33 @@ namespace {
     static unsigned g_mapOn = 1;
     /* Mirror of g_rowOn[kRowHud], used by the HUD build and draw. */
     static unsigned g_hudOn = 1;
+    /* Mirror of g_rowOn[kRowGift], used by the HUD gift row and by both
+     * tooltip hooks. */
+    static unsigned g_giftOn = 1;
+    /* Mirror of g_rowOn[kRowCrop], read by the crop label's build and draw. */
+    static unsigned g_cropOn = 1;
     /* The persisted HUD flag, out of bit 12 of the same preferences int the row
      * mask uses.  Kept next to s_fileMask for the page build, which needs the
      * value without re-reading the field. */
     static unsigned s_discHud = 1;
+    /* Same for the gift switch, out of bit 13. */
+    static unsigned s_discGift = 1;
+    /* And for the crop label, out of bit 15. */
+    static unsigned s_discCrop = 1;
+    /* v469: and for the animation row, out of bit 0 (bit 27 of disconnectDay).
+     * Separate from g_rowOn[0] on purpose: g_rowOn[0] tracks the LIVE option
+     * byte (the checkbox), this is what the file said. */
+    static unsigned s_discAnim = 1;
+    /* The Options object the animation bit was last pushed into.  Identity, not
+     * a one-shot flag: the boot path can replace Game1.options, and a replaced
+     * object would silently lose the write. */
+    static void* s_animOptSeen = nullptr;
+    /* 1 once a save has actually supplied the bit; the push below must not run
+     * on the default before that, or it would write "on" over a player's
+     * setting during the title screen. */
+    static unsigned s_animKnown = 0;
+    /* The value last written into Options+0x24, so a farm switch re-pushes. */
+    static unsigned s_animPushed = 0xFFFFFFFFu;
     /* Stage 185: the checkbox state is stored in the game's own Options
      * object instead of a file.
      *
@@ -1417,6 +1496,72 @@ namespace {
      * tab-only bisect stage has no page of its own. */
     constexpr int kVanillaOptsTab = 8;
     constexpr uintptr_t kReadSettingsOff = SDV_OFF(kReadSettingsOff, 0x1ADFC30u);
+    /* Billboard -- the calendar menu (and the quest board, same class). */
+    /* Game1.objectSpriteSheet (the 384x624 item sheet) and Game1.viewport,
+     * both statics: the first to draw the gift icons, the second to keep the
+     * tooltip box on screen. */
+    constexpr uintptr_t kViewportOff    = SDV_OFF(kViewportOff,    0xC95BBC0u);
+    /* v448: Game1.uiViewport, the UI coordinate space.
+     *
+     * Game1.Draw sets it as
+     *     uiViewport.Width  = ceil(viewport.Width  * zoomLevel / uiScale)
+     *     uiViewport.X      = viewport.X
+     * so `uiViewport.Width / viewport.Width` IS the world->UI scale factor --
+     * no need to read Options.zoomLevel / uiScale / zoomModifier at all.
+     * The HUD is drawn in this same space, so a world position converts with
+     *     ui = (world - viewport.xy) * (uiViewport.Width / viewport.Width) */
+    constexpr uintptr_t kUiViewportOff  = SDV_OFF(kUiViewportOff,  0xC95BBD0u);
+    constexpr uintptr_t kBillboardHoverOff = SDV_OFF(kBillboardHoverOff, 0x1722D60u);
+    constexpr uintptr_t kBillboardDrawOff  = SDV_OFF(kBillboardDrawOff,  0x1723230u);
+    /* SocialPage -- the "social" tab inside the menu (GameMenu page index 2).
+     *
+     * 1.6 rewrote this page around a SocialEntry list, but everything the
+     * tooltip needs is still a plain field.  Layout confirmed from the AOT
+     * metadata (type factory 0x7241ED0):
+     *
+     *   0x68 hoverText   0x70 upButton   0x78 downButton   0x80 scrollBar
+     *   0x88 scrollBarRunner   0x98 SocialEntries   0xA0 sprites
+     *   0xA8 slotPosition   0xAC numFarmers   0xB0 characterSlots
+     *
+     * SocialEntry (nested type, factory 0x72441F0):
+     *   0x18 Character   0x20 InternalName   0x28 DisplayName
+     *   0x30 IsMet       0x31 IsDatable      0x38 IsChild   0x39 IsPlayer
+     *
+     * InternalName is the NPC's INTERNAL name ("Abigail") -- exactly the key
+     * the generated gift table uses; DisplayName is the translated one.
+     * characterSlots[i] and SocialEntries[i] share one index: the game's own
+     * click test walks characterSlots[i].bounds for the same i. */
+    /* NOT hooked: SocialPage.performHoverAction 0x1840250.  Its first
+     * instruction is `str d8, [sp, #-0x30]!` -- a PRE-INDEXED store that
+     * writes SP, which the trampoline cannot relocate (see docs/METHODOLOGY.md:
+     * GameMenu.draw 0x17984B0 is un-hookable for the same reason).  Hooking it
+     * crashed the console the moment the menu opened.
+     *
+     * The hover coordinates are not needed from there anyway: menus are driven
+     * with Game1.getMouseX()/getMouseY(), so the draw hook asks the same two
+     * functions and gets the same numbers. */
+    constexpr uintptr_t kSocialDrawOff  = SDV_OFF(kSocialDrawOff,  0x1841DF0u);
+    constexpr uintptr_t kGetMouseXOff = SDV_OFF(kGetMouseXOff, 0x1455080u);
+    constexpr uintptr_t kGetMouseYOff = SDV_OFF(kGetMouseYOff, 0x1455090u);
+    /* IClickableMenu.drawTextureBox(batch, x, y, w, h, colour) -- the 6-argument
+     * overload, which is the one that draws Game1.menuTexture's (0,256,60,60)
+     * patch as a 9-slice with scale 1 and no drop shadow.  That is exactly what
+     * IClickableMenu.drawHoverText uses for its background, so a box drawn with
+     * it is indistinguishable from the game's own tooltips.
+     *
+     * (0x17A0710 is the full overload that takes the texture and the source
+     * rectangle explicitly; the short one loads both and tail-calls it.) */
+    constexpr uintptr_t kDrawTextureBoxOff = SDV_OFF(kDrawTextureBoxOff, 0x17A0640u);
+    /* Game1.textColor / textShadowColor -- the pair drawHoverText defaults to,
+     * i.e. the dark brown that reads correctly on the tan panel. */
+    constexpr uintptr_t kGameTextColorOff = SDV_OFF(kGameTextColorOff, 0xC95C128u);
+    constexpr unsigned kSocialEntriesOff = SDV_OFF(kSocialEntriesOff, 0x98u);
+    constexpr unsigned kSocialSlotsOff   = SDV_OFF(kSocialSlotsOff, 0xB0u);
+    constexpr unsigned kSocialSlotPosOff = SDV_OFF(kSocialSlotPosOff, 0xA8u);
+    constexpr unsigned kSocialEntryNameOff = SDV_OFF(kSocialEntryNameOff, 0x20u);
+    constexpr unsigned kSocialEntryMetOff  = SDV_OFF(kSocialEntryMetOff, 0x30u);
+    /* ClickableComponent.bounds -- a Rectangle, four ints. */
+    constexpr unsigned kBoundsOff = SDV_OFF(kBoundsOff, 0x10u);
     constexpr uintptr_t kSetOptionsOff = SDV_OFF(kSetOptionsOff, 0x1443540u);
     /* StartupPreferences layout, from .tmp/meta_startuppreferences.json
      * (size 0x70).  Every offset below is a declared field, not a guess:
@@ -1692,6 +1837,9 @@ namespace {
     static unsigned g_appendState = 0;   /* 1 ok / 2 no capacity / 3 bad list */
     static unsigned g_appendCount = 0;
     void (*s_origOptionsDraw)(void*, void*) = nullptr;
+    void (*s_origBillboardHover)(void*, int, int) = nullptr;
+    void (*s_origBillboardDraw)(void*, void*) = nullptr;
+    void (*s_origSocialDraw)(void*, void*) = nullptr;
     void (*s_origLoadPrefs)(void*, int, int, int) = nullptr;
     /* v199 probes on the write path itself.
      *
@@ -2163,6 +2311,70 @@ namespace {
      * back NetRef wrappers (1), bare features (2) or is still unknown (0), so
      * the unwrap stops calling Object.ToString() too. */
     static void* s_flooringKlass = nullptr;
+    /* v447: HoeDirt's klass, cached the first time a tilled tile is seen. */
+    static void* s_hoeDirtKlass = nullptr;
+    /* v448: and a few that are known NOT to be HoeDirt, so the class-name test
+     * (which allocates) runs once per terrain type instead of once per probe. */
+    constexpr int kHoeDirtNegMax = 6;
+    static void* s_hoeDirtNeg[kHoeDirtNegMax] = {};
+    static int s_hoeDirtNegNext = 0;
+    /* Growth of the crop on the tile in front.  Re-probed every 20 frames --
+     * watering changes the answer without the player moving, so a tile-change
+     * trigger alone would go stale. */
+    static int  s_cropDays = -1;
+    static unsigned s_cropFlags = 0;    /* 1 crop, 2 ready, 4 dead, 8 watered */
+    static unsigned s_cropDbg = 0;      /* why the probe stopped, diag row only */
+    static unsigned s_cropFrame = 0;
+    static int s_cropTx = 0;            /* the tile the label is drawn over */
+    static int s_cropTy = 0;
+    /* v450: the crop's harvest item id, its sprite index in
+     * Game1.objectSpriteSheet and its name -- -1 / null when it is not a
+     * vanilla crop (or the read failed).  Written by the probe, read by the
+     * draw and by the string builder. */
+    static int s_cropId = -1;
+    static int s_cropSprite = -1;
+    static int s_cropSheet = 0;         /* 0 = objectSpriteSheet, 1 = _2 */
+    /* v462: the icon's source rectangle, resolved by the game's own helper.
+     * Game1.objectSpriteSheet_2 does NOT have the main sheet's 24 columns, so
+     * the arithmetic that works for the main sheet lands on the wrong cell
+     * there -- hardware drew the ancient fruit for a bottle of ancient fruit
+     * wine.  The helper divides by the real texture width; it calls
+     * Texture2D.get_Width, so it runs in the probe, never in the draw. */
+    static void* s_cropIconSheet = nullptr;
+    static int s_cropIconX = 0;
+    static int s_cropIconY = 0;
+    static int s_cropIconKey = -1;
+    static const char16_t* s_cropName = nullptr;
+    /* v454: the machine on the tile in front.  1 machine, 2 ready to collect;
+     * s_machMinutes is minutesUntilReady, s_machSprite/Name describe the
+     * product (sprite -1 = the product has its own texture, no icon). */
+    static unsigned s_machFlags = 0;
+    static int s_machMinutes = 0;
+    static int s_machPid = -1;          /* product item id, part of the rebuild key */
+    static int s_machDays = 0;          /* cask only: whole days left */
+    static int s_machSprite = -1;
+    static int s_machSheet = 0;         /* 0 = objectSpriteSheet, 1 = _2 */
+    static void* s_machIconSheet = nullptr;
+    static int s_machIconX = 0;
+    static int s_machIconY = 0;
+    static int s_machIconKey = -1;
+    /* The product's real display name, copied out of the game's own string
+     * (see kObjLoadNameOff).  s_nameFrom is the object it was read from, so a
+     * new product re-reads it and nothing else does. */
+    static void* s_nameFrom = nullptr;  /* the product the label was built for */
+    static unsigned s_nameGen = 0;      /* bumped whenever the product changes */
+    /* v465: the composed preserve name ("上古水果果酒"), built from the baked
+     * ingredient table -- no managed call. */
+    static char16_t s_prodName[16] = {};
+    static int s_prodNameLen = 0;
+    static int s_machQuality = 0;       /* product quality: 0/1/2/4 */
+    /* Cask only: the NEXT quality tier (1/2/4), 0 when there is none.  Drawn on
+     * the second line, in the icon column -- "what this will turn into". */
+    static int s_machNextQ = 0;
+    static const char16_t* s_machName = nullptr;
+    static int s_machTx = 0;
+    static int s_machTy = 0;
+    static unsigned s_machFrame = 0;
     static void* s_treeKlass = nullptr;
     static unsigned s_featureWrapped = 0;
     /* Cumulative, so one reading tells the whole story:
@@ -11248,9 +11460,11 @@ namespace {
                         u"\u3000\u64AD\u79CD\u65BD\u80A5",        /* 　播种施肥  */
                         u"\u542F\u7528\u81EA\u52A8\u5316",        /* 启用自动化  */
                         u"\u5DE6\u4E0A\u89D2\u4FE1\u606F",        /* 左上角信息  */
+                        u"\u793C\u7269\u53E3\u5473\u63D0\u793A",        /* 礼物口味提示 */
+                        u"\u4F5C\u7269/\u673A\u5668\u63D0\u793A",      /* 作物/机器提示 */
                     };
                     static const int kRowLen[kRowCount] =
-                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5};
+                        {6, 4, 5, 3, 3, 3, 3, 3, 3, 5, 5, 5, 5, 6, 7};
                     /* Row 0 keeps the game's own `which` (35 -> +0x24), so the
                      * animation flag keeps working exactly as it always has.
                      * Every other row gets the sentinel: the click writes
@@ -11260,6 +11474,7 @@ namespace {
                         35, kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                         kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
                         kOptIndex2, kOptIndex2, kOptIndex2, kOptIndex2,
+                        kOptIndex2, kOptIndex2,
                     };
                     if (s_rowsApplied == 0) {
                         if (s_fileMaskOk != 0) {
@@ -11267,11 +11482,21 @@ namespace {
                                 g_rowOn[i] = (s_fileMask >> i) & 1u;
                             }
                             g_savedMask = kMaskTag | s_fileMask |
-                                          (s_discHud == 0 ? kMaskHudOffBit : 0u);
+                                          (s_discHud == 0 ? kMaskHudOffBit : 0u) |
+                                          (s_discGift == 0 ? kMaskGiftOffBit : 0u) |
+                                          (s_discCrop == 0 ? kMaskCropOffBit : 0u) |
+                                          (s_discAnim == 0 ? kMaskAnimOffBit : 0u);
                             g_tractorOn = g_rowOn[kRowMaster];
                             g_mapOn = g_rowOn[kRowMap];
+                            /* v469: row 0 is not in s_fileMask (it is an
+                             * off-bit), so seed it from the decode. */
+                            g_rowOn[0] = s_discAnim;
                             g_rowOn[kRowHud] = s_discHud;
                             g_hudOn = s_discHud;
+                            g_rowOn[kRowGift] = s_discGift;
+                            g_giftOn = s_discGift;
+                            g_rowOn[kRowCrop] = s_discCrop;
+                            g_cropOn = s_discCrop;
                         }
                         s_rowsApplied = 1;
                     }
@@ -11659,6 +11884,10 @@ namespace {
          * append loop put the HUD row in the list; this list is what the shrink
          * keeps, so leaving it out cuts the row off again. */
         order[n++] = kRowHud;
+        /* v446: same trap a third time -- RowOrder is what the shrink keeps. */
+        order[n++] = kRowGift;
+        /* v453: and a fourth.  Any row missing here is silently dropped. */
+        order[n++] = kRowCrop;
         return n;
     }
 
@@ -13363,6 +13592,56 @@ namespace {
     constexpr uintptr_t kTapperTerrainOff = 0x148u; /* GameLocation.terrainFeatures */
     constexpr uintptr_t kTapperDictOff    = 0x58u;  /* NetDictionary -> Dictionary */
     constexpr uintptr_t kTapperTryGetOff  = SDV_OFF(kTapperTryGetOff, 0x0DD0D70u);
+
+    /* v447: growth readout for the tile in front.  Every offset here was read
+     * out of the game's OWN code, not inferred -- see the note above
+     * ProbeFacingCrop for the instruction that proves each one. */
+    constexpr unsigned kCharFacingOff       = SDV_OFF(kCharFacingOff,       0x70u);
+    constexpr unsigned kHoeDirtNetCropOff   = SDV_OFF(kHoeDirtNetCropOff,   0x30u);
+    constexpr unsigned kHoeDirtStateOff     = SDV_OFF(kHoeDirtStateOff,     0x38u);
+    constexpr unsigned kCropPhaseDaysOff    = SDV_OFF(kCropPhaseDaysOff,    0x18u);
+    constexpr unsigned kCropCurrentPhaseOff = SDV_OFF(kCropCurrentPhaseOff, 0x30u);
+    constexpr unsigned kCropDayOfPhaseOff   = SDV_OFF(kCropDayOfPhaseOff,   0x40u);
+    constexpr unsigned kCropFullyGrownOff   = SDV_OFF(kCropFullyGrownOff,   0x68u);
+    constexpr unsigned kCropDeadOff         = SDV_OFF(kCropDeadOff,         0x80u);
+    /* v450: Crop.indexOfHarvest -- a NetString holding the harvest item id
+     * ("24" for a parsnip).  Offset from the AOT metadata for
+     * StardewValley.Crop (tools/find_factory_by_name.py StardewValley.Crop):
+     *   0x18 phaseDays  0x20 rowInSpriteSheet  0x30 currentPhase
+     *   0x38 indexOfHarvest  0x40 dayOfCurrentPhase  0x90 netSeedIndex
+     * size 0xF8, which is also why 0x80 (dead) and 0x68 (fullyGrown) above
+     * are inside the object. */
+    constexpr unsigned kCropHarvestIdOff    = SDV_OFF(kCropHarvestIdOff,    0x38u);
+    /* v454: machines.  All four from the AOT metadata for StardewValley.Object
+     * (size 0x218) and StardewValley.Item (size 0xA0):
+     *   Object.bigCraftable +0x100   Object.heldObject +0x138
+     *   Object.minutesUntilReady +0x150   Object.readyForHarvest +0x118
+     *   Item.parentSheetIndex +0x68  (plain int -- the product's sprite)
+     *   Item.itemId +0x70            (NetString -- "348", "(O)348") */
+    constexpr unsigned kObjBigCraftableOff  = SDV_OFF(kObjBigCraftableOff,  0x100u);
+    constexpr unsigned kObjMinutesOff       = SDV_OFF(kObjMinutesOff,       0x150u);
+    constexpr unsigned kMachSpriteOff       = SDV_OFF(kMachSpriteOff,       0x68u);
+    constexpr unsigned kMachItemIdOff       = SDV_OFF(kMachItemIdOff,       0x70u);
+    /* Object.preservedParentSheetIndex -- a NetString holding the ingredient's
+     * item id ("268" for starfruit, "Carrot" for the 1.6 ones). */
+    constexpr unsigned kObjPreservedParentOff = SDV_OFF(kObjPreservedParentOff, 0x1E8u);
+    /* Item.quality -- 0 normal, 1 silver, 2 gold, 4 iridium.  A cask's product
+     * goes up one tier at a time as it ages, so this is what tells you what the
+     * bottle will be.  The star sprites come from Game1.mouseCursors
+     * (kMouseCursorsOff, defined near the top for the festival badge). */
+    constexpr unsigned kItemQualityOff      = SDV_OFF(kItemQualityOff,      0x90u);
+    /* StardewValley.Objects.Cask (size 0x228, i.e. Object 0x218 + two fields).
+     * A cask does not use minutesUntilReady at all -- it ages by
+     * daysToMature / agingRate, which is why it showed no bubble in v454. */
+    constexpr int      kCrabPotId           = 710;   /* machine that is not bigCraftable */
+    constexpr int      kCaskId              = 163;   /* Data/BigCraftables 163 = Cask */
+    constexpr unsigned kCaskAgingRateOff    = SDV_OFF(kCaskAgingRateOff,    0x218u);
+    constexpr unsigned kCaskDaysToMatureOff = SDV_OFF(kCaskDaysToMatureOff, 0x220u);
+    /* readyForHarvest (+0x118) and heldObject (+0x138) already exist as
+     * kObjReadyOff / kObjHeldOff -- the automation feature uses them. */
+    constexpr unsigned kNetListCountOff     = SDV_OFF(kNetListCountOff,     0x50u);
+    constexpr unsigned kNetListArrayOff     = SDV_OFF(kNetListArrayOff,     0x58u);
+    constexpr unsigned kNetArrayElemsOff    = SDV_OFF(kNetArrayElemsOff,    0x58u);
     constexpr uintptr_t kTapperUpdateOff  = SDV_OFF(kTapperUpdateOff, 0x1B29830u);
     constexpr uintptr_t kObjToStringOff   = SDV_OFF(kObjToStringOff,  0x0259EE0u);
     /* Character.getTileX / getTileY -- ints, so no HFA return to get wrong. */
@@ -13409,6 +13688,15 @@ namespace {
      * why the HUD row kept coming back on.  Set means HUD OFF, so a value
      * written before this build still reads as "on". */
     constexpr unsigned kDiscHudOffBit = 0x01000000u;
+    /* v446: the gift switch, same idea one bit higher (bit 25).  Set = OFF, so
+     * a value written by an earlier build reads as on. */
+    constexpr unsigned kDiscGiftOffBit = 0x02000000u;
+    /* v453: the crop-label switch, bit 26.  Same encoding, set = OFF. */
+    constexpr unsigned kDiscCropOffBit = 0x04000000u;
+    /* v469: the animation row, bit 27.  Same encoding, set = OFF.  It has to
+     * ride this field rather than the preferences int: disconnectDay travels
+     * with the farm save, which is the only write this mod still causes. */
+    constexpr unsigned kDiscAnimOffBit = 0x08000000u;
     constexpr unsigned kDiscMaskBits = 0x0FFEu;      /* bits 1..11 */
     constexpr unsigned kDiscMustZero = 0xF001u;      /* bit 0 + bits 12..15 */
 
@@ -13519,6 +13807,17 @@ namespace {
          * Must happen before the g_savedMask sync so the staged value carries
          * it, and before g_rowOn[kRowHud] is restored further down. */
         s_discHud = (v & kDiscHudOffBit) != 0u ? 0u : 1u;
+        s_discGift = (v & kDiscGiftOffBit) != 0u ? 0u : 1u;
+        s_discCrop = (v & kDiscCropOffBit) != 0u ? 0u : 1u;
+        /* v469: the animation row, out of bit 27.  Set = OFF. */
+        s_discAnim = (v & kDiscAnimOffBit) != 0u ? 0u : 1u;
+        s_animKnown = 1;
+        if (s_discAnim != s_animPushed) {
+            /* The file says something we have not pushed yet (first pass of a
+             * session, or a different farm): let the HUD hook write it into
+             * Options+0x24 again. */
+            s_animOptSeen = nullptr;
+        }
         /* Audit: how many rows this pass is about to change.  Non-zero means
          * the field disagreed with what the UI had -- i.e. the second writer
          * fired with a different value, which is the condition for the
@@ -13527,7 +13826,7 @@ namespace {
             unsigned differ = 0;
             unsigned before = 0;
             for (int i = 1; i < kRowCount; i++) {
-                if (i == kRowHud) {
+                if (i == kRowHud || i == kRowGift || i == kRowCrop) {
                     continue;
                 }
                 if (g_rowOn[i] != 0) {
@@ -13555,28 +13854,36 @@ namespace {
          * s_discHud was just decoded from byte 3 of the same value, so the
          * staged mask carries the HUD bit in its own encoding (bit 12). */
         g_savedMask = kMaskTag | mask |
-                      (s_discHud == 0 ? kMaskHudOffBit : 0u);
+                      (s_discHud == 0 ? kMaskHudOffBit : 0u) |
+                      (s_discGift == 0 ? kMaskGiftOffBit : 0u) |
+                      (s_discCrop == 0 ? kMaskCropOffBit : 0u) |
+                      (s_discAnim == 0 ? kMaskAnimOffBit : 0u);
         /* Reached only after the marker test and the must-zero test both
          * passed, so this is trusted data, not "the function executed". */
         g_maskReady = true;
         for (int i = 1; i < kRowCount; i++) {
             g_rowOn[i] = (mask >> i) & 1u;
         }
-        /* The loop above walks all thirteen rows and bit 12 of `mask` is always
-         * clear, so it would switch the HUD row off once a second.  The value
-         * that belongs there is the one decoded a few lines up (byte 3). */
+        /* The loop above walks all fourteen rows and bits 12/13 of `mask` are
+         * always clear, so it would switch the HUD and gift rows off once a
+         * second.  The values that belong there are the ones decoded a few
+         * lines up (byte 3). */
         g_rowOn[kRowHud] = s_discHud;
+        g_rowOn[kRowGift] = s_discGift;
+        g_rowOn[kRowCrop] = s_discCrop;
         g_tractorOn = g_rowOn[kRowMaster];
         g_mapOn = g_rowOn[kRowMap];
         g_hudOn = g_rowOn[kRowHud];
+        g_giftOn = g_rowOn[kRowGift];
+        g_cropOn = g_rowOn[kRowCrop];
     }
 
     /* Write the current switch state into disconnectDay. */
     void FlushMaskToDisconnectDay() {
         unsigned m = 0;
         for (int i = 1; i < kRowCount; i++) {
-            if (i == kRowHud) {
-                continue;   /* carried in bit 24 below, not in this mask */
+            if (i == kRowHud || i == kRowGift || i == kRowCrop) {
+                continue;   /* carried in bits 24/25/26 below, not in this mask */
             }
             if (g_rowOn[i] != 0) {
                 m |= (1u << i);
@@ -13585,6 +13892,9 @@ namespace {
         const bool ok = WriteDisconnectDay(
             kDiscMark |
             (g_rowOn[kRowHud] == 0 ? kDiscHudOffBit : 0u) |
+            (g_rowOn[kRowGift] == 0 ? kDiscGiftOffBit : 0u) |
+            (g_rowOn[kRowCrop] == 0 ? kDiscCropOffBit : 0u) |
+            (g_rowOn[0] == 0 ? kDiscAnimOffBit : 0u) |
             (m & kDiscMaskBits));
         s_flushOk = ok ? 1u : 0u;
         ++s_flushCount;
@@ -14045,6 +14355,418 @@ namespace {
         return true;
     }
 
+    /* v447: is this TerrainFeature a tilled tile?
+     *
+     * Same shape as IsFlooringFeature: the class name is only read until the
+     * first success, then the klass pointer is compared -- and ToString() is a
+     * managed call that allocates, so it must never run per frame.  The caller
+     * throttles by tile, which is what keeps that promise. */
+    bool IsHoeDirtFeature(void* feature) {
+        if (feature == nullptr || !RangeReadable(feature, 8u)) {
+            return false;
+        }
+        void* klass = *reinterpret_cast<void**>(feature);
+        if (s_hoeDirtKlass != nullptr) {
+            return klass == s_hoeDirtKlass;     /* no managed call at all */
+        }
+        /* Negative cache.  FeatureNameIs -> ToString() ALLOCATES, and the probe
+         * runs several times a second; without this, standing in a mine or on
+         * grass would allocate a string every tick forever.  A handful of
+         * remembered "known not HoeDirt" classes is enough -- the player faces
+         * a handful of terrain types at a time. */
+        for (int i = 0; i < kHoeDirtNegMax; ++i) {
+            if (s_hoeDirtNeg[i] == klass) {
+                return false;
+            }
+        }
+        if (!FeatureNameIs(feature, "StardewValley.TerrainFeatures.HoeDirt")) {
+            s_hoeDirtNeg[s_hoeDirtNegNext] = klass;
+            s_hoeDirtNegNext = (s_hoeDirtNegNext + 1) % kHoeDirtNegMax;
+            return false;
+        }
+        s_hoeDirtKlass = klass;
+        return true;
+    }
+
+    /* v447: read a Net* field's payload.
+     *
+     * NetInt / NetBool / NetDirection / NetRef all keep it at wrapper+0x68 --
+     * the same slot this project has been reading since the tractor
+     * (netMount, usingTool).  Guarded at every hop: a wrong offset has to come
+     * back as "cannot read", never as a wild pointer. */
+    bool NetIntAt(void* owner, unsigned fieldOff, int* out) {
+        if (owner == nullptr || !RangeReadable(
+                reinterpret_cast<unsigned char*>(owner) + fieldOff, 8u)) {
+            return false;
+        }
+        void* w = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(owner) + fieldOff);
+        if (w == nullptr || !Plausible(w) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(w) + kNetValueOff, 4u)) {
+            return false;
+        }
+        *out = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(w) + kNetValueOff);
+        return true;
+    }
+
+    bool NetBoolAt(void* owner, unsigned fieldOff, bool* out) {
+        if (owner == nullptr || !RangeReadable(
+                reinterpret_cast<unsigned char*>(owner) + fieldOff, 8u)) {
+            return false;
+        }
+        void* w = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(owner) + fieldOff);
+        if (w == nullptr || !Plausible(w) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(w) + kNetValueOff, 1u)) {
+            return false;
+        }
+        *out = *reinterpret_cast<unsigned char*>(
+            reinterpret_cast<unsigned char*>(w) + kNetValueOff) != 0;
+        return true;
+    }
+
+    /* phaseDays[i].  NetIntList -> count(NetInt) + array(NetRef<NetArray>)
+     * -> NetArray.elements (List<NetInt>) -> NetInt.Value.  The chain is copied
+     * from NetIntList.IndexOf 0x117FEF0, which does exactly this to read an
+     * element. */
+    bool CropPhaseAt(void* list, int i, int* out) {
+        if (list == nullptr || !RangeReadable(
+                reinterpret_cast<unsigned char*>(list) + kNetListArrayOff, 8u)) {
+            return false;
+        }
+        void* arrayRef = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(list) + kNetListArrayOff);
+        if (arrayRef == nullptr || !Plausible(arrayRef) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(arrayRef) + kNetValueOff, 8u)) {
+            return false;
+        }
+        void* netArray = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(arrayRef) + kNetValueOff);
+        if (netArray == nullptr || !Plausible(netArray) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(netArray) + kNetArrayElemsOff,
+                8u)) {
+            return false;
+        }
+        void* elems = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(netArray) + kNetArrayElemsOff);
+        if (elems == nullptr || !Plausible(elems) ||
+            !RangeReadable(elems, 0x1Cu)) {
+            return false;
+        }
+        const int cnt = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(elems) + 0x18);
+        if (i < 0 || i >= cnt) {
+            return false;
+        }
+        void* wrapper = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(elems) + 0x10);
+        if (wrapper == nullptr || !Plausible(wrapper) ||
+            !RangeReadable(wrapper, 0x28u)) {
+            return false;
+        }
+        void** buf = *reinterpret_cast<void***>(
+            reinterpret_cast<unsigned char*>(wrapper) + 0x10);
+        if (buf == nullptr || !Plausible(buf)) {
+            return false;
+        }
+        void* netInt = buf[i];
+        if (netInt == nullptr || !Plausible(netInt) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(netInt) + kNetValueOff, 4u)) {
+            return false;
+        }
+        *out = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(netInt) + kNetValueOff);
+        return true;
+    }
+
+    /* Days until this crop can be harvested; 0 = ready now.
+     *
+     * The sum is UI Info Suite 2's ShowCropAndBarrelTime.CropRender, unchanged:
+     * a regrowing crop that is already fully grown reports dayOfCurrentPhase
+     * (days until the next fruit); everything else adds the remaining phases
+     * and subtracts the days already spent in the current one.  phaseDays ends
+     * with a 99999 sentinel, which is why the loop stops at Count - 1.
+     *
+     * Returns -1 when the crop cannot be read at all. */
+    int CropDaysLeft(void* crop, bool* ready, bool* dead) {
+        int phase = 0;
+        int dayOf = 0;
+        bool full = false;
+        bool isDead = false;
+        if (!NetIntAt(crop, kCropCurrentPhaseOff, &phase) ||
+            !NetIntAt(crop, kCropDayOfPhaseOff, &dayOf) ||
+            !NetBoolAt(crop, kCropFullyGrownOff, &full)) {
+            return -1;
+        }
+        (void)NetBoolAt(crop, kCropDeadOff, &isDead);
+        *dead = isDead;
+        *ready = false;
+        if (isDead) {
+            return -1;
+        }
+        if (crop == nullptr || !RangeReadable(
+                reinterpret_cast<unsigned char*>(crop) + kCropPhaseDaysOff, 8u)) {
+            return -1;
+        }
+        void* list = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(crop) + kCropPhaseDaysOff);
+        if (list == nullptr || !Plausible(list) ||
+            !RangeReadable(list, kNetListCountOff + 8u)) {
+            return -1;
+        }
+        void* countField = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(list) + kNetListCountOff);
+        if (countField == nullptr || !Plausible(countField) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(countField) + kNetValueOff,
+                4u)) {
+            return -1;
+        }
+        const int count = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(countField) + kNetValueOff);
+        /* phaseDays is DaysInPhase + the 99999 sentinel, so a real crop has at
+         * least two entries and never a hundred.  Anything else means one of
+         * the hops above landed on something that is not a phase list. */
+        if (count < 2 || count > 32) {
+            return -1;
+        }
+        if (phase < 0 || phase >= count) {
+            phase = count - 1;
+        }
+        int days = 0;
+        if (full && dayOf > 0) {
+            days = dayOf;
+        }
+        else {
+            for (int i = phase; i < count - 1; ++i) {
+                int v = 0;
+                if (!CropPhaseAt(list, i, &v)) {
+                    return -1;
+                }
+                days += v;
+            }
+            days -= dayOf;
+        }
+        if (days <= 0) {
+            days = 0;
+            *ready = true;
+        }
+        return days;
+    }
+
+    /* v450: which crop is this?
+     *
+     * Crop.indexOfHarvest is a NetString (wrapper at +0x38, payload at +0x68),
+     * so the item id is a bare managed string: length at +0x10, UTF-16 at
+     * +0x14.  Vanilla crop ids are plain decimal ("24", "188"), which is what
+     * crop_table.hpp is keyed on; anything else -- the 1.6 crops whose items
+     * live in their own texture, a modded crop -- returns -1 and the label
+     * simply shows no icon and no name.
+     *
+     * No managed call on this path at all: one pointer unwrap and a digit
+     * loop, which is why it is safe inside the probe. */
+    /* v462: (sheet, sprite) -> source rectangle, through the game's own
+     * helper.  Returns false when there is nothing to draw. */
+    bool ResolveIconRect(int sheetSel, int sprite, void** sheetOut, int* x,
+                         int* y) {
+        if (sprite < 0) {
+            return false;
+        }
+        void* sheet = *reinterpret_cast<void**>(
+            g_base + (sheetSel == 1 ? kObjectSheet2Off : kObjectSheetOff));
+        if (sheet == nullptr || !Plausible(sheet)) {
+            return false;
+        }
+        auto getRect = reinterpret_cast<SourceRect (*)(void*, int, int, int)>(
+            g_base + kGetSquareRectOff);
+        const SourceRect r = getRect(sheet, 16, 16, sprite);
+        if (r.w != 16 || r.h != 16 || r.x < 0 || r.y < 0) {
+            return false;
+        }
+        *sheetOut = sheet;
+        *x = r.x;
+        *y = r.y;
+        return true;
+    }
+
+    struct CropInfo {
+        int sprite;
+        int sheet;
+        const char16_t* name;
+        int key;                        /* stable id for the rebuild signature */
+    };
+
+    bool CropLookup(void* crop, CropInfo* out) {
+        void* slot = NetValueSlot(crop, kCropHarvestIdOff, 8u);
+        if (slot == nullptr) {
+            return false;
+        }
+        void* str = *reinterpret_cast<void**>(slot);
+        const int len = ManagedStrLen(str);
+        if (len <= 0 || len > 16) {
+            return false;
+        }
+        if (!RangeReadable(reinterpret_cast<unsigned char*>(str) + 0x14,
+                           static_cast<size_t>(len) * 2u)) {
+            return false;
+        }
+        const char16_t* p = reinterpret_cast<const char16_t*>(
+            reinterpret_cast<unsigned char*>(str) + 0x14);
+        /* Numeric id first: that is every pre-1.6 crop. */
+        int id = 0;
+        bool numeric = true;
+        for (int i = 0; i < len; ++i) {
+            if (p[i] < u'0' || p[i] > u'9') {
+                numeric = false;
+                break;
+            }
+            id = id * 10 + (p[i] - u'0');
+        }
+        if (numeric) {
+            const croptbl::Entry* e = croptbl::Find(id);
+            if (e == nullptr) {
+                return false;
+            }
+            out->sprite = e->sprite;
+            out->sheet = e->sheet;
+            out->name = e->name;
+            out->key = id;
+            return true;
+        }
+        /* v459: the four 1.6 crops harvest items with string ids ("Carrot"),
+         * so they need the ASCII-keyed table. */
+        const croptbl::StrEntry* se = croptbl::FindStr(p, len);
+        if (se == nullptr) {
+            return false;
+        }
+        out->sprite = se->sprite;
+        out->sheet = se->sheet;
+        out->name = se->name;
+        out->key = 0x4000 + static_cast<int>(se - croptbl::kStrTable);
+        return true;
+    }
+
+    /* v447: what is on the tile the player is facing?
+     *
+     * UI Info Suite 2 triggers this on hover; there is no pointer here, so the
+     * trigger is the tile in front -- the same thing that mod's gamepad branch
+     * uses (GetGrabTile).  Direction 0/1/2/3 = up/right/down/left.
+     *
+     * Cheap enough to run every frame, but it is throttled by tile anyway: the
+     * only managed call on the path (FeatureNameIs -> ToString) runs until the
+     * HoeDirt klass is cached, and that must not happen 60 times a second. */
+    void ProbeFacingCrop() {
+        s_cropDbg = 0;
+        s_cropFlags = 0;
+        s_cropDays = -1;
+        s_cropId = -1;
+        s_cropSprite = -1;
+        s_cropSheet = 0;
+        s_cropName = nullptr;
+        void* pl = CarryPlayer();
+        if (pl == nullptr) {
+            return;
+        }
+        const Vec2 base = reinterpret_cast<Vec2 (*)(void*)>(
+            g_base + kGetTileBodyOff)(pl);
+        int face = 2;
+        if (!NetIntAt(pl, kCharFacingOff, &face)) {
+            s_cropDbg = 1;
+            return;
+        }
+        int tx = static_cast<int>(base.x);
+        int ty = static_cast<int>(base.y);
+        switch (face) {
+            case 0: --ty; break;
+            case 1: ++tx; break;
+            case 2: ++ty; break;
+            case 3: --tx; break;
+            default: break;
+        }
+        s_cropTx = tx;
+        s_cropTy = ty;
+        void* dict = TerrainDict();
+        if (dict == nullptr) {
+            s_cropDbg = 2;
+            return;
+        }
+        void* feature = nullptr;
+        if (!reinterpret_cast<bool (*)(void*, float, float, void**)>(
+                g_base + kTapperTryGetOff)(
+                dict, static_cast<float>(tx), static_cast<float>(ty),
+                &feature) ||
+            feature == nullptr) {
+            s_cropDbg = 3;                    /* bare ground */
+            return;
+        }
+        feature = UnwrapFeature(feature);
+        if (!IsHoeDirtFeature(feature)) {
+            s_cropDbg = 4;                    /* not tilled */
+            return;
+        }
+        int state = 0;
+        if (NetIntAt(feature, kHoeDirtStateOff, &state) && state == 1) {
+            s_cropFlags |= 8u;                /* watered */
+        }
+        if (!RangeReadable(
+                reinterpret_cast<unsigned char*>(feature) + kHoeDirtNetCropOff,
+                8u)) {
+            s_cropDbg = 5;
+            return;
+        }
+        void* cropRef = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(feature) + kHoeDirtNetCropOff);
+        if (cropRef == nullptr || !Plausible(cropRef) || !RangeReadable(
+                reinterpret_cast<unsigned char*>(cropRef) + kNetValueOff, 8u)) {
+            s_cropDbg = 6;                    /* tilled, nothing planted */
+            return;
+        }
+        void* crop = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(cropRef) + kNetValueOff);
+        if (crop == nullptr || !Plausible(crop)) {
+            s_cropDbg = 6;
+            return;
+        }
+        /* Before the growth read: a dead crop still gets its icon, and a crop
+         * whose phase list is unreadable still knows what it is. */
+        {
+            CropInfo ci{};
+            if (CropLookup(crop, &ci)) {
+                s_cropId = ci.key;
+                s_cropSprite = ci.sprite;
+                s_cropSheet = ci.sheet;
+                s_cropName = ci.name;
+                const int key = (ci.sheet << 16) | (ci.sprite & 0xFFFF);
+                if (key != s_cropIconKey) {
+                    s_cropIconKey = key;
+                    if (!ResolveIconRect(ci.sheet, ci.sprite, &s_cropIconSheet,
+                                         &s_cropIconX, &s_cropIconY)) {
+                        s_cropIconSheet = nullptr;
+                        s_cropIconKey = -1;
+                    }
+                }
+            }
+        }
+        bool ready = false;
+        bool dead = false;
+        const int days = CropDaysLeft(crop, &ready, &dead);
+        if (days < 0) {
+            s_cropDbg = dead ? 8u : 7u;
+            if (dead) {
+                /* A dead crop is still worth a line -- "已枯萎" is the answer. */
+                s_cropFlags |= 5u;            /* crop + dead */
+            }
+            return;
+        }
+        s_cropFlags |= 1u;
+        if (ready) {
+            s_cropFlags |= 2u;
+        }
+        s_cropDays = days;
+        s_cropDbg = 16u;
+    }
+
+
     /* v362: look up the tile the player is standing on.  Deliberately bypasses
      * the flood, the budget and the cache -- it answers one question: does the
      * terrain dictionary see a Flooring where I am standing? */
@@ -14430,6 +15152,79 @@ namespace {
 
     /* Defined below with the pond hook; RunAutomation is above it. */
     void CollectPonds();
+
+    /* v454: the item id of a managed Item, as an int.
+     *
+     * Item.itemId is a NetString (+0x70) holding "348" for legacy items and
+     * "(O)348" when the game has qualified it -- both forms appear, so the
+     * prefix is skipped rather than rejected.  Anything else (a 1.6 string id
+     * such as "DriedFruit", a modded item) returns -1 and the machine bubble
+     * shows the timer without a name. */
+    int ItemIdDigits(void* item) {
+        void* slot = NetValueSlot(item, kMachItemIdOff, 8u);
+        if (slot == nullptr) {
+            return -1;
+        }
+        void* str = *reinterpret_cast<void**>(slot);
+        const int len = ManagedStrLen(str);
+        if (len <= 0 || len > 12) {
+            return -1;
+        }
+        if (!RangeReadable(reinterpret_cast<unsigned char*>(str) + 0x14,
+                           static_cast<size_t>(len) * 2u)) {
+            return -1;
+        }
+        const char16_t* p = reinterpret_cast<const char16_t*>(
+            reinterpret_cast<unsigned char*>(str) + 0x14);
+        int i = 0;
+        if (len > 3 && p[0] == u'(') {
+            /* "(O)348" for objects, "(BC)163" for big craftables. */
+            int j = 1;
+            while (j < len && j < 5 && p[j] != u')') {
+                ++j;
+            }
+            if (j < len && p[j] == u')') {
+                i = j + 1;
+            }
+        }
+        if (i >= len) {
+            return -1;
+        }
+        int id = 0;
+        for (; i < len; ++i) {
+            if (p[i] < u'0' || p[i] > u'9') {
+                return -1;
+            }
+            id = id * 10 + (p[i] - u'0');
+        }
+        return id;
+    }
+
+    /* NetFloat payload: a float in the same +0x68 slot NetInt uses. */
+    bool NetFloatAt(void* owner, uintptr_t off, float* out) {
+        void* slot = NetValueSlot(owner, off, 4u);
+        if (slot == nullptr) {
+            return false;
+        }
+        *out = *reinterpret_cast<float*>(slot);
+        return true;
+    }
+
+    /* Is this Object a cask?
+     *
+     * A cask keeps its progress in daysToMature/agingRate, NOT in
+     * minutesUntilReady, so the generic machine test never fires for it -- that
+     * is why the cellar showed nothing in v454.
+     *
+     * Identified by item id, not by a class-name test: Data/BigCraftables has
+     * 163 = Cask (the same key the machine data uses, "(BC)163"), and the id is
+     * a plain NetString read -- no managed ToString, no allocation on a path
+     * that runs every 4 frames.  A cask is also bigCraftable, and the object
+     * with id 163 in Data/Objects (a fish) is never a placed object, so
+     * "bigCraftable && id 163" cannot mean anything else. */
+    bool IsCask(void* obj) {
+        return ItemIdDigits(obj) == kCaskId;
+    }
 
     void RunAutomation() {
         s_dbgRegChests = static_cast<unsigned>(s_regChestCount);
@@ -15145,6 +15940,250 @@ namespace {
      * is the right thing to call.  The PC mod guards with weeds.IsWeeds()
      * before performToolAction; without it we would poke chests and machines. */
     constexpr uintptr_t kObjectIsWeedsOff = SDV_OFF(kObjectIsWeedsOff, 0x19D49D0u);
+
+
+    /* v454: what is the machine in front doing, and how long has it left?
+     *
+     * Objects are NOT terrain features: they live in GameLocation.objects
+     * (NetDictionary<Vector2,Object>, +0xC8) and are read through the game's
+     * own thunk (kObjectsTryGetOff, the same call the tractor uses to find
+     * weeds).  Everything after that is a field read:
+     *
+     *     Object.bigCraftable      +0x100  NetBool
+     *     Object.readyForHarvest   +0x118  NetBool
+     *     Object.heldObject        +0x138  NetRef<Object>  (payload at +0x68)
+     *     Object.minutesUntilReady +0x150  NetInt
+     *
+     * UI Info Suite 2 gates its machine timer on exactly bigCraftable &&
+     * minutes > 0 && heldObject != null (and skips the Heater); this adds the
+     * "done, waiting to be collected" case, which is the one worth knowing
+     * about without walking over. */
+    void ProbeFacingMachine() {
+        s_machFlags = 0;
+        s_machMinutes = 0;
+        s_machDays = 0;
+        s_machPid = -1;
+        s_machSprite = -1;
+        s_machSheet = 0;
+        s_machQuality = 0;
+        s_machNextQ = 0;
+        /* s_nameFrom is NOT cleared: the cache is keyed by the product object,
+         * so leaving it lets a re-probe skip the call entirely. */
+        s_machName = nullptr;
+        void* pl = CarryPlayer();
+        if (pl == nullptr) {
+            return;
+        }
+        const Vec2 base = reinterpret_cast<Vec2 (*)(void*)>(
+            g_base + kGetTileBodyOff)(pl);
+        int face = 2;
+        if (!NetIntAt(pl, kCharFacingOff, &face)) {
+            return;
+        }
+        int tx = static_cast<int>(base.x);
+        int ty = static_cast<int>(base.y);
+        switch (face) {
+            case 0: --ty; break;
+            case 1: ++tx; break;
+            case 2: ++ty; break;
+            case 3: --tx; break;
+            default: break;
+        }
+        s_machTx = tx;
+        s_machTy = ty;
+        void* loc = reinterpret_cast<void* (*)(void)>(g_base + kGame1CurrentLocOff)();
+        if (loc == nullptr || !Plausible(loc) ||
+            !RangeReadable(reinterpret_cast<unsigned char*>(loc) + kObjectsOff, 8u)) {
+            return;
+        }
+        void* dict = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(loc) + kObjectsOff);
+        if (dict == nullptr || !Plausible(dict)) {
+            return;
+        }
+        void* obj = nullptr;
+        if (!reinterpret_cast<bool (*)(void*, Vec2, void**)>(
+                g_base + kObjectsTryGetOff)(
+                dict, Vec2{static_cast<float>(tx), static_cast<float>(ty)},
+                &obj) ||
+            obj == nullptr || !Plausible(obj)) {
+            return;
+        }
+        bool big = false;
+        (void)NetBoolAt(obj, kObjBigCraftableOff, &big);
+        /* Crab pots (item 710) are machines too but are NOT big craftables --
+         * they sit in water and fill overnight.  Everything else that is not a
+         * big craftable in `objects` is scenery or a dropped item, so only
+         * these two kinds get a bubble. */
+        if (!big && ItemIdDigits(obj) != kCrabPotId) {
+            return;
+        }
+        int mins = 0;
+        if (!NetIntAt(obj, kObjMinutesOff, &mins)) {
+            return;
+        }
+        bool ready = false;
+        (void)NetBoolAt(obj, kObjReadyOff, &ready);
+        int caskDays = -1;
+        /* A cask is checked FIRST, before the minutes path -- the same order
+         * UI Info Suite 2 uses.  Hardware showed why: a cask does carry a
+         * minutesUntilReady, and it is a huge sentinel (the cellar read
+         * "还剩 624 天 13 小时" for a wine that has 56 days left).  Its real
+         * progress is daysToMature / agingRate, so those two fields win. */
+        if (IsCask(obj)) {
+            float aging = 0.0f;
+            float left = 0.0f;
+            if (!NetFloatAt(obj, kCaskAgingRateOff, &aging) ||
+                !NetFloatAt(obj, kCaskDaysToMatureOff, &left) ||
+                aging <= 0.0f || left < -0.5f || left > 4000.0f) {
+                return;
+            }
+            ready = false;
+            if (left <= 0.0f) {
+                ready = true;            /* iridium quality: done */
+            }
+            else {
+                caskDays = static_cast<int>(left / aging);
+                if (caskDays <= 0) {
+                    caskDays = 1;
+                }
+            }
+        }
+        else if (mins <= 0 && !ready) {
+            return;                      /* idle machine: nothing to say */
+        }
+        void* slot = NetValueSlot(obj, kObjHeldOff, 8u);
+        if (slot == nullptr) {
+            return;
+        }
+        void* held = *reinterpret_cast<void**>(slot);
+        if (held == nullptr || !Plausible(held)) {
+            return;
+        }
+        s_machFlags = 1u | (ready ? 2u : 0u) | (caskDays >= 0 ? 4u : 0u);
+        s_machMinutes = mins > 0 ? mins : 0;
+        s_machDays = caskDays > 0 ? caskDays : 0;
+        /* The product's own sprite index is a plain int at Item+0x68, but for
+         * the flavoured items (wine / juice / jelly / pickles) it addresses a
+         * different sheet, so the table's answer wins whenever it has one. */
+        /* v464: NO managed call here any more.
+         *
+         * v460 asked Object.loadDisplayName for the composed name ("杨桃酒").
+         * It worked on its own, but hardware showed automation stalling at the
+         * moment a machine finished -- and the user traced it back to this
+         * change.  The function dereferences preserve / preservedParentSheetIndex
+         * without checking, and anything thrown from there unwinds through our
+         * update hook, skipping everything after it in the frame -- including
+         * AutomateTick.  A tooltip is not worth that risk: the table name is
+         * used again, and every product the table covers still reads correctly.
+         *
+         * (The address and the call shape are recorded in docs/MACHINE_INFO.md
+         * §4c, so this can come back later as a table-only composition if it is
+         * ever worth it.) */
+        const int pid = ItemIdDigits(held);
+        s_machQuality = 0;
+        if (RangeReadable(reinterpret_cast<unsigned char*>(held) + kItemQualityOff,
+                          4u)) {
+            const int q = *reinterpret_cast<int*>(
+                reinterpret_cast<unsigned char*>(held) + kItemQualityOff);
+            if (q == 1 || q == 2 || q == 4) {
+                s_machQuality = q;
+            }
+        }
+        /* v467: a cask's product climbs one tier at a time, so the label says
+         * what the NEXT tier is instead of what it is now.  Needs only the
+         * current quality -- no defaultDaysToMature thresholds involved. */
+        s_machNextQ = 0;
+        if (IsCask(obj) && s_machQuality != 4) {
+            s_machNextQ = s_machQuality == 0 ? 1
+                          : (s_machQuality == 1 ? 2 : 4);
+        }
+        if (held != s_nameFrom) {
+            s_nameFrom = held;
+            ++s_nameGen;         /* product changed: rebuild the label */
+        }
+        /* v465: compose the preserve name ourselves, from baked data.
+         *
+         * Data/Objects carries both halves:
+         *     Wine_Flavored_Name    "{0}果酒"
+         *     Juice_Flavored_Name   "{0}果汁"
+         *     Jelly_Flavored_Name   "{0}果酱"
+         *     Pickles_Flavored_Name "腌制{0}"
+         * and preserve_table.hpp has the ingredient id -> name map (every fruit
+         * and vegetable).  No managed call, so this cannot disturb the rest of
+         * the frame the way v460's loadDisplayName did. */
+        s_prodNameLen = 0;
+        if (pid == 342 || pid == 344 || pid == 348 || pid == 350) {
+            void* psiSlot = NetValueSlot(held, kObjPreservedParentOff, 8u);
+            void* psi = psiSlot != nullptr
+                            ? *reinterpret_cast<void**>(psiSlot)
+                            : nullptr;
+            const int plen = ManagedStrLen(psi);
+            if (plen > 0 &&
+                RangeReadable(reinterpret_cast<unsigned char*>(psi) + 0x14,
+                              static_cast<size_t>(plen) * 2u)) {
+                const presv::Entry* ing = presv::Find(
+                    reinterpret_cast<const char16_t*>(
+                        reinterpret_cast<unsigned char*>(psi) + 0x14),
+                    plen);
+                if (ing != nullptr) {
+                    int c = 0;
+                    if (pid == 342) {                 /* "腌制" + name */
+                        static const char16_t kPre[] = u"\u814C\u5236";
+                        for (int i = 0; kPre[i] != 0 && c < 4; ++i) {
+                            s_prodName[c++] = kPre[i];
+                        }
+                    }
+                    for (int i = 0; ing->name[i] != 0 && c < 10; ++i) {
+                        s_prodName[c++] = ing->name[i];
+                    }
+                    if (pid != 342) {
+                        static const char16_t kW[] = u"\u679C\u9152";
+                        static const char16_t kJ[] = u"\u679C\u6C41";
+                        static const char16_t kG[] = u"\u679C\u9171";
+                        const char16_t* suf =
+                            pid == 348 ? kW : (pid == 350 ? kJ : kG);
+                        for (int i = 0; suf[i] != 0 && c < 12; ++i) {
+                            s_prodName[c++] = suf[i];
+                        }
+                    }
+                    s_prodName[c] = 0;
+                    s_prodNameLen = c;
+                }
+            }
+        }
+        s_machPid = pid;
+        const machtbl::Entry* e = pid >= 0 ? machtbl::Find(pid) : nullptr;
+        if (e != nullptr) {
+            s_machName = e->name;
+            s_machSprite = e->sprite;
+            s_machSheet = e->sheet;
+        }
+        else if (pid >= 0 && RangeReadable(
+                     reinterpret_cast<unsigned char*>(held) + kMachSpriteOff, 4u)) {
+            /* Unknown but numeric: a vanilla item, so its parentSheetIndex is an
+             * index into the standard sheet.  Non-numeric ids (DriedFruit and
+             * friends) are skipped -- their index may point into another sheet
+             * and would draw the wrong picture. */
+            const int sp = *reinterpret_cast<int*>(
+                reinterpret_cast<unsigned char*>(held) + kMachSpriteOff);
+            if (sp >= 0 && sp < 24 * 39) {
+                s_machSprite = sp;
+            }
+        }
+        {
+            const int key = (s_machSheet << 16) | (s_machSprite & 0xFFFF);
+            if (key != s_machIconKey) {
+                s_machIconKey = key;
+                if (!ResolveIconRect(s_machSheet, s_machSprite, &s_machIconSheet,
+                                     &s_machIconX, &s_machIconY)) {
+                    s_machIconSheet = nullptr;
+                    s_machIconKey = -1;
+                }
+            }
+        }
+    }
+
     /* v281 -- seeds and fertilizer, the one attachment family the tractor was
      * still missing.
      *
@@ -17626,13 +18665,24 @@ namespace {
                         s_fileMask = v & kMaskBits;
                         s_fileMaskOk = 1;
                         s_discHud = (v & kMaskHudOffBit) != 0u ? 0u : 1u;
+                        s_discGift = (v & kMaskGiftOffBit) != 0u ? 0u : 1u;
+                        s_discCrop = (v & kMaskCropOffBit) != 0u ? 0u : 1u;
+                        s_discAnim = (v & kMaskAnimOffBit) != 0u ? 0u : 1u;
                         g_savedMask = kMaskTag | s_fileMask |
-                                      (s_discHud == 0 ? kMaskHudOffBit : 0u);
+                                      (s_discHud == 0 ? kMaskHudOffBit : 0u) |
+                                      (s_discGift == 0 ? kMaskGiftOffBit : 0u) |
+                                      (s_discCrop == 0 ? kMaskCropOffBit : 0u) |
+                                      (s_discAnim == 0 ? kMaskAnimOffBit : 0u);
                         for (int i = 1; i < kRowCount; i++) {
                             g_rowOn[i] = (s_fileMask >> i) & 1u;
                         }
+                        g_rowOn[0] = s_discAnim;   /* v469: off-bit, not a mask bit */
                         g_rowOn[kRowHud] = s_discHud;
                         g_hudOn = s_discHud;
+                        g_rowOn[kRowGift] = s_discGift;
+                        g_giftOn = s_discGift;
+                        g_rowOn[kRowCrop] = s_discCrop;
+                        g_cropOn = s_discCrop;
                         g_tractorOn = g_rowOn[kRowMaster];
                         g_mapOn = g_rowOn[kRowMap];
                     }
@@ -17743,6 +18793,13 @@ namespace {
             }
             s_elemChecked = *reinterpret_cast<unsigned char*>(
                 reinterpret_cast<unsigned char*>(g_ourElem) + 0x51);
+            /* v469: row 0 joins the row table.  Its box is the game's own (the
+             * ctor seeds it from Options+0x24 and a click writes that byte), so
+             * reading +0x51 here is the same information -- and it is read
+             * under the pinning rule above, where the page is provably alive.
+             * The change detector a few lines down needs this to see a click on
+             * row 0 at all; without it the flush would never fire for it. */
+            g_rowOn[0] = (s_elemChecked != 0) ? 1u : 0u;
             s_optFlags |= 4u;   /* latched: an element exists for this page */
         }
         /* v312: every row below the animation one is ours alone -- sentinel
@@ -17763,6 +18820,7 @@ namespace {
             g_tractorOn = g_rowOn[kRowMaster];
             g_mapOn = g_rowOn[kRowMap];
             g_hudOn = g_rowOn[kRowHud];
+            g_giftOn = g_rowOn[kRowGift];
 
             /* Stage the values TryPerformSave injects into the serialised copy.
              *
@@ -17780,7 +18838,7 @@ namespace {
             }
             else {
                 bool changed = false;
-                for (unsigned i = 1; i < kRowCount && i < g_ourCount; i++) {
+                for (unsigned i = 0; i < kRowCount && i < g_ourCount; i++) {
                     if (s_rowPrev[i] != static_cast<unsigned char>(g_rowOn[i])) {
                         changed = true;
                     }
@@ -17795,13 +18853,19 @@ namespace {
                      * to move it too or the next rebuild would resurrect the
                      * value from boot. */
                     s_discHud = g_rowOn[kRowHud];
+                    s_discGift = g_rowOn[kRowGift];
+                    s_discCrop = g_rowOn[kRowCrop];
+                    /* v469: row 0 is a real switch now; its live state comes
+                     * from Options+0x24 (g_rowOn[0] mirrors it every frame). */
+                    s_discAnim = g_rowOn[0];
                     unsigned m = 0;
                     for (int i = 1; i < kRowCount; i++) {
-                        /* kRowHud is deliberately not in the mask: bit 12 is
-                         * outside both kMaskBits and kDiscMaskBits, and a bit
-                         * the loader does not know about would fail the
-                         * "is this ours" test and reset every other switch. */
-                        if (i == kRowHud) {
+                        /* kRowHud / kRowGift are deliberately not in the mask:
+                         * bits 12 and 13 are outside both kMaskBits and
+                         * kDiscMaskBits, and a bit the loader does not know
+                         * about would fail the "is this ours" test and reset
+                         * every other switch. */
+                        if (i == kRowHud || i == kRowGift || i == kRowCrop) {
                             continue;
                         }
                         if (g_rowOn[i] != 0) {
@@ -17813,7 +18877,10 @@ namespace {
                      * save -- so quitting and restarting (no sleep) lost it,
                      * while the other eleven survived through preferences. */
                     g_savedMask = kMaskTag | m |
-                                  (g_rowOn[kRowHud] == 0 ? kMaskHudOffBit : 0u);
+                                  (g_rowOn[kRowHud] == 0 ? kMaskHudOffBit : 0u) |
+                                  (g_rowOn[kRowGift] == 0 ? kMaskGiftOffBit : 0u) |
+                                  (g_rowOn[kRowCrop] == 0 ? kMaskCropOffBit : 0u) |
+                                  (g_rowOn[0] == 0 ? kMaskAnimOffBit : 0u);
                     /* v431 experiment: also put it into the LIVE Options, with
                      * a plain 4-byte store -- no managed call, nothing that can
                      * deadlock.  TryPerformSave only runs at a farm save, so
@@ -18537,6 +19604,39 @@ namespace {
                 g_saveWanted = 1;   /* ask for a real save on this frame */
             }
             s_optBit = *flag;
+            /* v469: row 0 (动画加速2倍) is the game's OWN option, so its state
+             * lives in this byte and only ever reached the disk through
+             * startup_preferences -- the file this mod stopped writing in v427.
+             * That is why the box came back ticked after a restart while every
+             * other row, which rides the farm save, survived.
+             *
+             * Only the OFF state is pushed.  It is the one state the game
+             * cannot know about, and it is exactly the value the player's own
+             * click would have written into this byte -- which matters, because
+             * the byte is borrowed from an option index (35) that this build
+             * does not put on any screen.  Pushing "on" would mean writing 1
+             * into it on every boot for players who never touched the switch,
+             * and a field we borrow is a field we do not get to decide for.
+             *
+             * Identity, not a one-shot flag: the boot path can replace
+             * Game1.options, and a replaced object loses the write.
+             *
+             * The write is deliberately NOT dressed up as a click -- g_desired
+             * and g_savedFlag move with it, so the click detector above stays
+             * quiet and nothing asks for a preferences save we no longer make.
+             */
+            if (s_animKnown != 0 && g_options != nullptr &&
+                g_options != s_animOptSeen) {
+                s_animOptSeen = g_options;
+                if (s_discAnim == 0 && *flag != 0) {
+                    *flag = 0;
+                    g_desired = 0;
+                    g_savedFlag = 0;
+                    s_optBit = 0;
+                }
+                s_animPushed = s_discAnim;
+            }
+            g_rowOn[0] = (*flag != 0) ? 1u : 0u;
         }
         s_desired = g_desired;
         s_optFlags = (s_optFlags & ~8u) | (g_wroteFlag ? 8u : 0u);
@@ -18694,10 +19794,70 @@ namespace {
     CachedStr s_bdayLine{nullptr, 0, 0};
     int  s_bdayKey = -2;
     int  s_bdayShow = 0;
+    /* Gift hint for the same NPC, on its own line.  Kept separate from
+     * s_bdayLine because that string shares its row with the portrait and the
+     * tool column and is already clipped; this one has the full width. */
+    CachedStr s_giftLine{nullptr, 0, 0};
+    int  s_giftKey = -2;
+    int  s_giftShow = 0;
+    /* v447: the crop line's string and its visibility flag.  The scalars the
+     * probe writes live up with s_hoeDirtKlass, because ProbeFacingCrop is
+     * defined long before this point. */
+    static unsigned s_cropSig = 0xFFFFFFFFu;
+    CachedStr s_cropLine;
+    int  s_cropShow = 0;
+    static int s_cropW = 0;             /* widest line, in 1/100 line height */
+    /* v454: the machine label, same three pieces (string, width, signature). */
+    static unsigned s_machSig = 0xFFFFFFFFu;
+    CachedStr s_machLine;
+    int  s_machShow = 0;
+    static int s_machW = 0;             /* widest line, in 1/100 line height */
+    static int s_machLines = 2;         /* 1 when the product name is unknown */
+    /* Calendar hover: which day cell the cursor is over, 0 when none.  Written
+     * by the hover hook, read by the draw hook -- the game calls hover first
+     * every frame, so the value is always this frame's. */
+    static int s_calDay = 0;
+    static int s_calX = 0;          /* cursor, for the tooltip position */
+    static int s_calY = 0;
+    /* One cached string per gift name.  Built when the hovered NPC changes and
+     * validated before every draw: these have no GC root (the module's data
+     * segment is not scanned), so a collection can free them while the pointer
+     * stays here. */
+    CachedStr s_calName[gift::MAX_ITEMS];
+    int  s_calCount = 0;
+    const char* s_calNpc = nullptr;
+    int  s_calSeason = -1;
+    /* Social page: which entry the cursor is over (-1 = none), and where the
+     * cursor is, for the tooltip position. */
+    static int s_socialEntry = -1;
+    static int s_socialX = 0;
+    static int s_socialY = 0;
+    /* Same caching shape as the calendar: the names are rebuilt when the
+     * hovered entry changes and validated before every draw (no GC root). */
+    CachedStr s_socName[gift::MAX_ITEMS];
+    int  s_socCount = 0;
+    int  s_socKey = -2;
+    /* Read-out for the gift tooltip.  s_giftDbg counts what the social page
+     * hook found: bit0 = the slot list was readable, bit1 = an entry was hit,
+     * bit2 = the entry has a gift table row, bit3 = the names were built,
+     * bit4 = the entry was skipped because that NPC is not met yet. */
+    static unsigned s_giftDbg = 0;
+    /* Read-out for the tooltip position: the social page's own width and the
+     * x the box actually landed on, so a screenshot answers "did the clamp
+     * fire and what was it clamping against". */
+    static int s_pgL = 0;
+    static int s_pgW = 0;
+    static int s_tipX = 0;
+    static int s_tipY = 0;
+    static int s_tipW = 0;
     void* s_bdayNpc = nullptr;   /* resolved once per day, drawn from its sheet */
     int   s_bdayCrop = 0;        /* head window inside that sheet */
     int   s_bdayDbg = 0;         /* probe: 1 found, 2 sprite, 4 texture */
     int   s_bdayBaked = 0;       /* 1 = draw the baked Leo head */
+    /* Portrait retry: see ResolveBirthdayNpc.  Frames since the last attempt,
+     * and how many attempts have been made. */
+    int   s_bdayRetryFrame = 0;
+    int   s_bdayRetry = 0;
     int   s_weatherKey = -1;
     /* The string object we last built the weather line from.  The calendar key
      * alone is not enough: at load Game1.weatherForTomorrow still holds its
@@ -18729,7 +19889,7 @@ namespace {
     int   s_wxStable = 0;
     void* s_wxLastPtr = nullptr;
     /* Diagnostic block: one line per item, built in the update hook. */
-    constexpr int kDiagLines = 13;
+    constexpr int kDiagLines = 14;
     CachedStr s_diag[kDiagLines]{};
 
     /* Phase-3 probe result.  Filled in the update hook, formatted into
@@ -19686,8 +20846,389 @@ namespace {
      * was tried on 2026-11-06 and reverted: GetWeatherForLocation("Default")
      * returned a fresh LocationWeather whose WeatherForTomorrow is the default
      * "Sun", so the row went back to always saying 晴. */
+    /* Resolve today's birthday NPC and the crop window inside its sheet.
+     *
+     * Called when the day changes -- and again on a timer while it keeps
+     * coming back empty.  The retry is not optional: FindBirthdayNpc walks
+     * Game1.locations and their character lists, and on the first frames after
+     * a save load those are still being filled, so the NPC is simply not there
+     * yet.  Resolving once per day then leaves the row without a portrait
+     * until the player sleeps, which is exactly what was reported. */
+    void ResolveBirthdayNpc(int bs, int bd) {
+        char sprite[16];
+        s_bdayNpc = FindBirthdayNpc(bs, bd, sprite, 16);
+        s_bdayBaked = 0;
+        if (s_bdayNpc == nullptr) {
+            /* Leo lives on Ginger Island and is absent from Game1.locations
+             * unless it is loaded.  His head is baked into the binary, so draw
+             * that instead. */
+            const char* en = BirthdayEnglish(bs, bd);
+            if (en != nullptr && std::strcmp(en, "Leo") == 0) {
+                s_bdayBaked = 1;
+            }
+        }
+        s_bdayDbg = s_bdayNpc != nullptr ? 1 : 0;
+        if (s_bdayNpc != nullptr && Plausible(s_bdayNpc) &&
+            RangeReadable(s_bdayNpc, 0x58u)) {
+            void* ns = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(s_bdayNpc) + 0x50);
+            if (ns != nullptr && Plausible(ns) && RangeReadable(ns, 0x70u)) {
+                void* sp = *reinterpret_cast<void**>(
+                    reinterpret_cast<unsigned char*>(ns) + 0x68);
+                if (sp != nullptr && Plausible(sp) &&
+                    RangeReadable(sp, 0x18u)) {
+                    s_bdayDbg |= 2;
+                    void* tx = *reinterpret_cast<void**>(
+                        reinterpret_cast<unsigned char*>(sp) + 0x10);
+                    void* wt = *reinterpret_cast<void**>(
+                        g_base + kStaminaRectOff);
+                    void* mt = (wt != nullptr && Plausible(wt))
+                                   ? *reinterpret_cast<void**>(wt)
+                                   : nullptr;
+                    if (tx != nullptr && mt != nullptr && Plausible(tx) &&
+                        *reinterpret_cast<void**>(tx) == mt) {
+                        s_bdayDbg |= 4;
+                    }
+                }
+            }
+        }
+        s_bdayCrop = npccrop::Lookup(sprite);
+        if (s_bdayCrop < 0) {
+            s_bdayCrop = 0;
+        }
+        if (s_bdayCrop > 40) {
+            s_bdayCrop = 40;
+        }
+    }
+
+    /* v452: how wide one character of the crop label is, in hundredths of a
+     * line height (SpriteFont.LineSpacing).
+     *
+     * These are MEASURED, not guessed.  v449-v451 assumed a full-width CJK
+     * glyph advances by one whole line height, and the box came out ~70% wider
+     * than its text -- obvious the moment a longer string was shown ("6 天·
+     * 已浇水" left a third of the panel empty on the right).
+     *
+     * Calibration, from a screenshot of v451 with dialogueFont:
+     *
+     *   line pitch (two lines)        26 px  == LineSpacing
+     *   CJK glyph pitch               15.7 px  -> 0.60 L
+     *   "6" advance                   ~8 px    -> 0.31 L
+     *   space + middot                narrower -> 0.23 / 0.31 L
+     *
+     * Cross-check against the same shot: box width 178 px for 565/100 L of
+     * text, i.e. text 170 px + 72 px of icon and padding -- consistent with
+     * the scale factor the frame and the icon implied.
+     *
+     * Per-character is still an estimate (SpriteFont.MeasureString would be
+     * exact), but the advance of a CJK glyph is uniform in this font, so the
+     * residual is a few pixels instead of a third of the panel. */
+    int CropCharUnits(char16_t c) {
+        if (c >= 0x2E80) {
+            return 60;          /* full-width CJK */
+        }
+        if (c == u' ') {
+            return 23;
+        }
+        return 33;              /* digits, the · separator */
+    }
+
+    /* v468: the two tile bubbles -- crop growth and machine timer.
+     *
+     * They used to sit at the end of BuildHudStrings, which returns early when
+     * the 左上角信息 switch is off.  So turning the HUD rows off silently took
+     * both bubbles with it, even though their own switch (作物/机器提示) was
+     * still on.  They are world-space labels, not HUD rows, so they get their
+     * own entry point and the update hook calls it unconditionally. */
+    void BuildTileLabels() {
+        /* v447: growth of the crop on the tile in front.
+         *
+         * Re-probed every 4 frames rather than on tile change: watering a plant
+         * changes the answer while the player stands still, and turning on the
+         * spot changes the tile without moving.  At 4 frames the label follows
+         * a turn within 0.07 s, which reads as instant.  The cost is one
+         * dictionary lookup plus a handful of field reads -- the class-name test
+         * that allocates is behind the negative cache in IsHoeDirtFeature. */
+        {
+            if (++s_cropFrame >= 4) {
+                s_cropFrame = 0;
+                ProbeFacingCrop();
+            }
+            /* The harvest id is part of the signature: two neighbouring tiles
+             * can hold different crops with the same day count and the same
+             * watering state, and the name and icon have to follow the tile.
+             * 0xFFFF marks "no crop", which cannot collide with a real id. */
+            const unsigned sig =
+                ((static_cast<unsigned>(s_cropId < 0 ? 0xFFFF : s_cropId) &
+                  0xFFFFu) << 16) |
+                (s_cropFlags << 8) |
+                (static_cast<unsigned>(s_cropDays < 0 ? 0xFEu : s_cropDays) &
+                 0xFFu);
+            if (g_cropOn == 0) {
+                /* v453: switched off from the Mod page.  Drop the string as
+                 * well as the flag -- the draw runs every frame and must not
+                 * find a stale line the moment the switch flips.  Forcing the
+                 * signature to "nothing" makes the next switch-on rebuild. */
+                s_cropShow = 0;
+                s_cropSig = 0xFFFFFFFFu;
+            }
+            else if (sig != s_cropSig ||
+                     (s_cropShow != 0 && !CachedStrOk(s_cropLine))) {
+                s_cropSig = sig;
+                s_cropShow = 0;
+                if ((s_cropFlags & 1u) != 0) {
+                    /* v451: three facts, two lines.
+                     *
+                     *   [icon] 防风草
+                     *          8 天·已浇水
+                     *
+                     * Line 1 is WHAT the crop is, line 2 is its state.  That
+                     * split is what keeps the box narrow: putting the name
+                     * beside the day count on one line would have made it 3.5
+                     * tiles wide, which over a single tile reads as covering
+                     * the neighbouring crops.
+                     *
+                     * Without a name (the 1.6 crops whose items live in their
+                     * own texture, any modded crop) the old shape stays: state
+                     * on line 1, watering on line 2, no icon. */
+                    char16_t state[12];
+                    int sl = 0;
+                    if ((s_cropFlags & 4u) != 0) {
+                        static const char16_t kX[] =
+                            u"\u5DF2\u67AF\u840E";              /* 已枯萎 */
+                        for (int i = 0; kX[i] != 0 && sl < 8; ++i) {
+                            state[sl++] = kX[i];
+                        }
+                    }
+                    else if ((s_cropFlags & 2u) != 0) {
+                        static const char16_t kR[] = u"\u53EF\u6536\u83B7";
+                        for (int i = 0; kR[i] != 0 && sl < 8; ++i) {
+                            state[sl++] = kR[i];
+                        }
+                    }
+                    else {
+                        sl = AppendUnsigned(state, sl,
+                                            static_cast<unsigned>(s_cropDays));
+                        state[sl++] = u' ';
+                        state[sl++] = u'\u5929';                    /* 天 */
+                    }
+
+                    const bool named = s_cropName != nullptr;
+                    char16_t buf[32];
+                    int c = 0;
+                    if (named) {
+                        for (int i = 0; s_cropName[i] != 0 && c < 10; ++i) {
+                            buf[c++] = s_cropName[i];
+                        }
+                    }
+                    else {
+                        for (int i = 0; i < sl && c < 10; ++i) {
+                            buf[c++] = state[i];
+                        }
+                    }
+                    const int line1 = c;
+                    buf[c++] = u'\n';
+                    int line2 = 0;
+                    if (named) {
+                        for (int i = 0; i < sl && c < 20; ++i) {
+                            buf[c++] = state[i];
+                            ++line2;
+                        }
+                        buf[c++] = u'\u00B7';                       /* · */
+                        ++line2;
+                    }
+                    static const char16_t kW[] = u"\u5DF2\u6D47\u6C34";
+                    static const char16_t kD[] = u"\u672A\u6D47\u6C34";
+                    const char16_t* st = (s_cropFlags & 8u) != 0 ? kW : kD;
+                    for (int i = 0; st[i] != 0 && c < 30; ++i) {
+                        buf[c++] = st[i];
+                        ++line2;
+                    }
+                    buf[c] = 0;
+                    CachedStrBuild(&s_cropLine, buf, c);
+                    /* Width in hundredths of a line height, from the measured
+                     * per-character advances in CropCharUnits -- the panel has
+                     * to hug its text, not reserve a tile's worth of slack. */
+                    int u1 = 0;
+                    int u2 = 0;
+                    for (int i = 0; i < line1; ++i) {
+                        u1 += CropCharUnits(buf[i]);
+                    }
+                    for (int i = 0; i < line2; ++i) {
+                        u2 += CropCharUnits(buf[line1 + 1 + i]);
+                    }
+                    s_cropW = u1 > u2 ? u1 : u2;
+                    s_cropShow = 1;
+                }
+            }
+        }
+
+        /* v454: the machine on the tile in front.
+         *
+         * Same 4-frame cadence as the crop probe.  minutesUntilReady moves in
+         * 10-minute steps, so the only thing that could go stale between
+         * probes is the last hour of a job -- and one frame of that is 0.07 s.
+         *
+         * Layout matches the crop label: icon + product name on line 1, the
+         * timer on line 2.  When the product is not in machine_table.hpp
+         * (a 1.6 string id, a modded item) the name line is dropped instead of
+         * showing an empty one. */
+        {
+            if (++s_machFrame >= 4) {
+                s_machFrame = 0;
+                ProbeFacingMachine();
+            }
+            /* The product id is in the key: two machines can run the same
+             * length job with different products (a keg of wine and a keg of
+             * juice both take days), and the name has to follow the tile. */
+            /* The product generation is in the key: string-id products share
+             * pid == -1, so the id alone would leave a stale name behind. */
+            const unsigned msig =
+                (s_machFlags << 28) |
+                ((s_nameGen & 0xFu) << 24) |
+                ((static_cast<unsigned>(s_machPid < 0 ? 0xFFFu : s_machPid) &
+                  0xFFFu) << 12) |
+                ((static_cast<unsigned>(s_machMinutes) & 0xFFFu) ^
+                 ((static_cast<unsigned>(s_machDays) & 0xFFu) << 4));
+            if (g_cropOn == 0) {
+                /* v457: the machine bubble shares the crop's switch. */
+                s_machShow = 0;
+                s_machSig = 0xFFFFFFFFu;
+            }
+            else if (msig != s_machSig ||
+                     (s_machShow != 0 && !CachedStrOk(s_machLine))) {
+                s_machSig = msig;
+                s_machShow = 0;
+                if ((s_machFlags & 1u) != 0) {
+                    /* "还剩 3小时20分" / "还剩 45分" / "还剩 1天4小时", or
+                     * "可收获" once the job is done. */
+                    char16_t time[20];
+                    int tn = 0;
+                    if ((s_machFlags & 2u) != 0) {
+                        static const char16_t kR[] = u"\u53EF\u6536\u83B7";
+                        for (int i = 0; kR[i] != 0 && tn < 8; ++i) {
+                            time[tn++] = kR[i];
+                        }
+                    }
+                    else if ((s_machFlags & 4u) != 0) {
+                        /* Cask: progress is whole days, not minutes. */
+                        static const char16_t kPre[] = u"\u8FD8\u5269 ";
+                        for (int i = 0; kPre[i] != 0 && tn < 6; ++i) {
+                            time[tn++] = kPre[i];
+                        }
+                        tn = AppendUnsigned(time, tn,
+                                            static_cast<unsigned>(s_machDays));
+                        static const char16_t kDay[] = u"\u5929";
+                        for (int i = 0; kDay[i] != 0 && tn < 18; ++i) {
+                            time[tn++] = kDay[i];
+                        }
+                    }
+                    else {
+                        static const char16_t kPre[] = u"\u8FD8\u5269 ";
+                        for (int i = 0; kPre[i] != 0 && tn < 6; ++i) {
+                            time[tn++] = kPre[i];
+                        }
+                        static const char16_t kHour[] = u"\u5C0F\u65F6";
+                        static const char16_t kMin[]  = u"\u5206";
+                        static const char16_t kDay[]  = u"\u5929";
+                        const int m = s_machMinutes;
+                        if (m >= 1600) {
+                            tn = AppendUnsigned(time, tn,
+                                                static_cast<unsigned>(m / 1600));
+                            for (int i = 0; kDay[i] != 0 && tn < 14; ++i) {
+                                time[tn++] = kDay[i];
+                            }
+                            const int h = (m % 1600) / 100;
+                            if (h > 0 && tn < 16) {
+                                tn = AppendUnsigned(time, tn,
+                                                    static_cast<unsigned>(h));
+                                for (int i = 0; kHour[i] != 0 && tn < 19; ++i) {
+                                    time[tn++] = kHour[i];
+                                }
+                            }
+                        }
+                        else {
+                            const int h = m / 60;
+                            const int mm = m % 60;
+                            if (h > 0) {
+                                tn = AppendUnsigned(time, tn,
+                                                    static_cast<unsigned>(h));
+                                for (int i = 0; kHour[i] != 0 && tn < 12; ++i) {
+                                    time[tn++] = kHour[i];
+                                }
+                            }
+                            if (mm > 0 || h == 0) {
+                                tn = AppendUnsigned(time, tn,
+                                                    static_cast<unsigned>(mm));
+                                for (int i = 0; kMin[i] != 0 && tn < 18; ++i) {
+                                    time[tn++] = kMin[i];
+                                }
+                            }
+                        }
+                    }
+
+                    /* v465: the composed preserve name wins ("上古水果果酒");
+                     * the table's generic name ("果酒") is the fallback. */
+                    char16_t buf[32];
+                    int c = 0;
+                    const bool named = s_prodNameLen > 0 || s_machName != nullptr;
+                    if (s_prodNameLen > 0) {
+                        for (int i = 0; i < s_prodNameLen && c < 14; ++i) {
+                            buf[c++] = s_prodName[i];
+                        }
+                    }
+                    else if (s_machName != nullptr) {
+                        for (int i = 0; s_machName[i] != 0 && c < 12; ++i) {
+                            buf[c++] = s_machName[i];
+                        }
+                    }
+                    const int line1 = c;
+                    if (named) {
+                        buf[c++] = u'\n';
+                        for (int i = 0; i < tn && c < 30; ++i) {
+                            buf[c++] = time[i];
+                        }
+                    }
+                    else {
+                        /* No name: the timer is the whole label, one line. */
+                        c = 0;
+                        for (int i = 0; i < tn && c < 20; ++i) {
+                            buf[c++] = time[i];
+                        }
+                    }
+                    buf[c] = 0;
+                    CachedStrBuild(&s_machLine, buf, c);
+                    int u1 = 0;
+                    int u2 = 0;
+                    if (named) {
+                        for (int i = 0; i < line1; ++i) {
+                            u1 += CropCharUnits(buf[i]);
+                        }
+                        for (int i = line1 + 1; i < c; ++i) {
+                            u2 += CropCharUnits(buf[i]);
+                        }
+                    }
+                    else {
+                        /* One line: the timer is the whole string. */
+                        for (int i = 0; i < c; ++i) {
+                            u1 += CropCharUnits(buf[i]);
+                        }
+                    }
+                    s_machW = u1 > u2 ? u1 : u2;
+                    s_machLines = named ? 2 : 1;
+                    s_machShow = 1;
+                }
+            }
+        }
+    }
+
     void BuildHudStrings() {
-        if (!kHudInfo || g_hudOn == 0) {
+        if (!kHudInfo) {
+            return;
+        }
+        /* The tile bubbles have their own switch; see BuildTileLabels. */
+        BuildTileLabels();
+        if (g_hudOn == 0) {
             return;
         }
 
@@ -19844,7 +21385,27 @@ namespace {
                      s_discMaskLast, s_applyCount, s_applyDiffer,
                      g_maskReady ? 1 : 0, s_saveSkipped, s_liveWrites);
             DiagLine(11, tmp);
-            DiagLine(12, s_probeAText);
+            /* The gift tooltip.  e = the social entry the cursor is on
+             * (-1 = none), d = what the hover test managed to read, c = how
+             * many gift names are cached, b = the birthday portrait probe
+             * (bit0 found NPC, bit1 sprite, bit2 texture) -- the three bits
+             * that used to be printed inside the birthday line itself. */
+            snprintf(tmp, sizeof(tmp),
+                     "v%d gift e=%d d=%03x c=%d b=%d g=%d l=%d pw=%d x=%d",
+                     kBuildNo, s_socialEntry, s_giftDbg & 0xFFu, s_socCount,
+                     s_bdayDbg, g_giftOn, s_pgL, s_pgW, s_tipX);
+            DiagLine(12, tmp);
+            /* v447: crop readout.  d = days left (-1 = none), f = flags
+             * (1 crop, 2 ready, 4 dead, 8 watered), r = how far the probe got
+             * (16 = success, 1 facing, 2 dict, 3 bare, 4 not tilled,
+             * 6 nothing planted, 7 phase list unreadable, 8 dead). */
+            snprintf(tmp, sizeof(tmp), "crop d=%d f=%x r=%u",
+                     s_cropDays, s_cropFlags, s_cropDbg);
+            DiagLine(13, tmp);
+            /* The probe-D line used to be drawn here.  The probe is compiled
+             * out for good (see docs/RETROSPECTIVE_ACTIVE_SAVE.md), so the row
+             * only ever showed a frozen "ps=0" -- one line of noise on every
+             * frame for nothing. */
         }
 
         /* Birthday: today's first, then tomorrow's.  One row, no icon.
@@ -19876,54 +21437,7 @@ namespace {
                 }
                 s_bdayShow = name != nullptr ? 1 : 0;
                 if (name != nullptr) {
-                    /* Their head, drawn from the same sheet the map markers
-                     * use.  The sprite name picks the window inside it. */
-                    char sprite[16];
-                    s_bdayNpc = FindBirthdayNpc(bs, bd, sprite, 16);
-                    s_bdayBaked = 0;
-                    if (s_bdayNpc == nullptr) {
-                        /* Leo lives on Ginger Island and is absent from
-                         * Game1.locations unless it is loaded.  His head is
-                         * baked into the binary, so draw that instead. */
-                        const char* en = BirthdayEnglish(bs, bd);
-                        if (en != nullptr && std::strcmp(en, "Leo") == 0) {
-                            s_bdayBaked = 1;
-                        }
-                    }
-                    s_bdayDbg = s_bdayNpc != nullptr ? 1 : 0;
-                    if (s_bdayNpc != nullptr && Plausible(s_bdayNpc) &&
-                        RangeReadable(s_bdayNpc, 0x58u)) {
-                        void* ns = *reinterpret_cast<void**>(
-                            reinterpret_cast<unsigned char*>(s_bdayNpc) + 0x50);
-                        if (ns != nullptr && Plausible(ns) &&
-                            RangeReadable(ns, 0x70u)) {
-                            void* sp = *reinterpret_cast<void**>(
-                                reinterpret_cast<unsigned char*>(ns) + 0x68);
-                            if (sp != nullptr && Plausible(sp) &&
-                                RangeReadable(sp, 0x18u)) {
-                                s_bdayDbg |= 2;
-                                void* tx = *reinterpret_cast<void**>(
-                                    reinterpret_cast<unsigned char*>(sp) + 0x10);
-                                void* wt = *reinterpret_cast<void**>(
-                                    g_base + kStaminaRectOff);
-                                void* mt = (wt != nullptr && Plausible(wt))
-                                               ? *reinterpret_cast<void**>(wt)
-                                               : nullptr;
-                                if (tx != nullptr && mt != nullptr &&
-                                    Plausible(tx) &&
-                                    *reinterpret_cast<void**>(tx) == mt) {
-                                    s_bdayDbg |= 4;
-                                }
-                            }
-                        }
-                    }
-                    s_bdayCrop = npccrop::Lookup(sprite);
-                    if (s_bdayCrop < 0) {
-                        s_bdayCrop = 0;
-                    }
-                    if (s_bdayCrop > 40) {
-                        s_bdayCrop = 40;
-                    }
+                    ResolveBirthdayNpc(bs, bd);
                     char16_t buf[40];
                     int n = 0;
                     for (int i = 0; pre[i] != 0 && n < 8; i++) {
@@ -19932,20 +21446,11 @@ namespace {
                     for (int i = 0; name[i] != 0 && n < 30; i++) {
                         buf[n++] = name[i];
                     }
+                    /* The " f0s0t0" probe tag used to be appended here in dev
+                     * builds.  It was visible text ("今日 山姆 f0s0t0生日"),
+                     * which reads as a bug rather than a readout -- and the
+                     * same three bits are already on the diagnostic row. */
                     const char16_t suf[] = u"生日";
-                    if (kHudRawProbe) {
-                        /* dev only: f=found s=sprite t=texture */
-                        const char16_t tag[] = u" f0s0t0";
-                        for (int i = 0; tag[i] != 0 && n < 34; i++) {
-                            buf[n++] = tag[i];
-                        }
-                        buf[n - 5] = static_cast<char16_t>(
-                            u'0' + (s_bdayDbg & 1));
-                        buf[n - 3] = static_cast<char16_t>(
-                            u'0' + ((s_bdayDbg >> 1) & 1));
-                        buf[n - 1] = static_cast<char16_t>(
-                            u'0' + ((s_bdayDbg >> 2) & 1));
-                    }
                     for (int i = 0; suf[i] != 0 && n < 38; i++) {
                         buf[n++] = suf[i];
                     }
@@ -19953,6 +21458,71 @@ namespace {
                     CachedStrBuild(&s_bdayLine, buf, n);
                 }
             }
+        }
+
+        /* Portrait retry.  A birthday row with no head next to it is the
+         * normal state for the first second after a save load (the locations
+         * are still filling in), and the day key does not change, so nothing
+         * would ever try again.  Poll at most once every 20 frames, and give
+         * up after 60 tries (~20 s) so a genuinely absent NPC -- one that
+         * lives somewhere never loaded -- does not cost a scan forever. */
+        if (s_bdayShow != 0 && s_bdayNpc == nullptr && s_bdayBaked == 0) {
+            if (s_bdayRetry < 60) {
+                if (++s_bdayRetryFrame >= 20) {
+                    s_bdayRetryFrame = 0;
+                    ++s_bdayRetry;
+                    ResolveBirthdayNpc(s_wxSeason, s_wxDay);
+                }
+            }
+        }
+        else {
+            s_bdayRetry = 0;
+            s_bdayRetryFrame = 0;
+        }
+
+        /* Gift hint for the same NPC, on the row below.  Same key as the
+         * birthday row, so it is rebuilt on a day boundary and never per
+         * frame -- and when there is no birthday it builds no string at all,
+         * for the reason spelled out above. */
+        if (kGiftHint && g_giftOn != 0) {
+            const char* ben = (s_bdayShow != 0 && s_wxValid != 0)
+                                  ? BirthdayEnglish(s_wxSeason, s_wxDay)
+                                  : nullptr;
+            const gift::Entry* g = gift::Find(ben);
+            if (g == nullptr || g->count == 0) {
+                s_giftShow = 0;
+                s_giftKey = -2;
+            }
+            else if (s_giftKey != s_bdayKey || !CachedStrOk(s_giftLine)) {
+                s_giftKey = s_bdayKey;
+                char16_t buf[24];
+                int n = 0;
+                static const char16_t kPre[] = u"最爱 ";
+                for (int i = 0; kPre[i] != 0 && n < 6; ++i) {
+                    buf[n++] = kPre[i];
+                }
+                /* Only the first two here: this row shares its width with the
+                 * portrait and the tool column.  The full list is on the
+                 * calendar tooltip. */
+                for (int k = 0; k < 2 && k < g->count; ++k) {
+                    const char16_t* nm = gift::At(*g, k).name;
+                    if (k != 0) {
+                        buf[n++] = u'\u00B7';
+                    }
+                    for (int i = 0; nm[i] != 0 && n < 22; ++i) {
+                        buf[n++] = nm[i];
+                    }
+                }
+                buf[n] = 0;
+                CachedStrBuild(&s_giftLine, buf, n);
+                s_giftShow = 1;
+            }
+        }
+        else if (s_giftShow != 0) {
+            /* Switch just went off: clear the flag here as well as in the
+             * draw, or the frame in between would still show the old row. */
+            s_giftShow = 0;
+            s_giftKey = -2;
         }
 
         /* Daily luck.  s_luckThousandths is sampled once a second in update. */
@@ -20015,13 +21585,284 @@ namespace {
         }
     }
 
+    /* v448/v454: a label drawn over a tile -- the crop's growth and the
+     * machine's timer are the same panel with different text.
+     *
+     * World -> UI conversion.  Game1.Draw sets
+     *     uiViewport.Width = ceil(viewport.Width * zoomLevel / uiScale)
+     * so `uiViewport.Width / viewport.Width` IS the scale factor, and the HUD
+     * is drawn in that same space.  Reading the two rectangles therefore
+     * needs no Options field and no guess about what zoomLevel is on this
+     * console.
+     *
+     * The panel is the game's own 9-slice (IClickableMenu.drawTextureBox) with
+     * Game1.textColor -- the same two calls the gift tooltip uses -- but drawn
+     * with dialogueFont, the font the game itself uses for its hover panels.
+     * v449 sized it from SpriteFont.LineSpacing; v452 replaced the per-character
+     * estimate with measured advances (CropCharUnits).  `units` is the width of
+     * the widest line in 1/100 line height, `lines` is 1 or 2. */
+    void DrawTileLabel(void* batch, int tx, int ty, void* msg, int units,
+                       void* iconSheet, int srcX, int srcY, int lines,
+                       int quality, int nextQ) {
+        if (msg == nullptr || batch == nullptr || units <= 0 || lines <= 0) {
+            return;
+        }
+        void* vp = reinterpret_cast<void*>(g_base + kViewportOff);
+        void* uivp = reinterpret_cast<void*>(g_base + kUiViewportOff);
+        if (!Plausible(vp) || !Plausible(uivp) ||
+            !RangeReadable(vp, 16u) || !RangeReadable(uivp, 16u)) {
+            return;
+        }
+        unsigned char* v = reinterpret_cast<unsigned char*>(vp);
+        unsigned char* u = reinterpret_cast<unsigned char*>(uivp);
+        const int vx = *reinterpret_cast<int*>(v);
+        const int vy = *reinterpret_cast<int*>(v + 4);
+        const int vw = *reinterpret_cast<int*>(v + 8);
+        const int uw = *reinterpret_cast<int*>(u + 8);
+        const int uh = *reinterpret_cast<int*>(u + 12);
+        if (vw <= 0 || uw <= 0 || uh <= 0) {
+            return;
+        }
+        const float scale = static_cast<float>(uw) / static_cast<float>(vw);
+        /* Tile centre horizontally, tile top edge vertically. */
+        const float wx = static_cast<float>(tx) * 64.0f + 32.0f;
+        const float wy = static_cast<float>(ty) * 64.0f;
+        const int sx = static_cast<int>((wx - static_cast<float>(vx)) * scale);
+        const int sy = static_cast<int>((wy - static_cast<float>(vy)) * scale);
+
+        /* v449: size the panel from the font instead of from a guess.
+         *
+         * v448 used 22px per character with 10px of padding.  Both numbers are
+         * below what the 9-slice needs -- its corners are ~12px -- so the first
+         * and last glyph sat ON the frame and the label read as a box too small
+         * for its own text.  SpriteFont.LineSpacing (int at +0x2C, getter
+         * 0x0C7290 is `ldr w0,[x0,#0x2c]`) is the line pitch.
+         *
+         * Dialogue font, not small font: at 720p the small font is ~20px tall,
+         * which is legible only at arm's length and visibly smaller than the
+         * HUD rows next to it.  The game draws its own hover panels (Billboard's
+         * birthday hint) with dialogueFont, so this still reads as vanilla. */
+        void* font = *reinterpret_cast<void**>(g_base + kGame1DialogueFontOff);
+        if (!Plausible(font)) {
+            font = *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
+        }
+        if (!Plausible(font) || !RangeReadable(font, 0x30u)) {
+            return;
+        }
+        int lineH = 24;
+        {
+            const int v2 = *reinterpret_cast<int*>(
+                reinterpret_cast<unsigned char*>(font) + 0x2C);
+            if (v2 >= 14 && v2 <= 72) {
+                lineH = v2;
+            }
+        }
+        constexpr int kPadX = 16;       /* must exceed the 12px 9-slice corner */
+        constexpr int kPadY = 12;
+        /* v450: the product/crop sprite, left of the text.  16x16 object sprite
+         * drawn into a 32x32 destination -- at 720p the 1x icon is too small to
+         * tell a parsnip from a potato.
+         *
+         * Resolved once, here, so the width reserved and the icon drawn can
+         * never disagree (a null sheet means no icon and no extra width). */
+        constexpr int kIcon = 32;
+        constexpr int kGap = 8;
+        /* The source rect was resolved in the probe (it needs the texture
+         * width); all this function does is draw it. */
+        void* sheet = iconSheet;
+        const bool haveIcon = Plausible(sheet) && srcX >= 0 && srcY >= 0;
+        const int iconW = haveIcon ? kIcon + kGap : 0;
+        const int boxW = (units * lineH) / 100 + kPadX * 2 + iconW;
+        int boxH = lineH * (lines > 1 ? 2 : 1) + kPadY * 2;
+        if (haveIcon && boxH < kIcon + kPadY * 2) {
+            boxH = kIcon + kPadY * 2;
+        }
+        int bx = sx - boxW / 2;
+        int by = sy - boxH - 6;         /* just above the tile */
+        if (by < 0) {
+            by = sy + 70;               /* no room above: below the tile */
+        }
+        if (bx < 0) {
+            bx = 0;
+        }
+        if (bx + boxW > uw) {
+            bx = uw - boxW;
+        }
+        if (by + boxH > uh) {
+            by = uh - boxH;
+        }
+        if (bx < 0) {
+            bx = 0;
+        }
+        if (by < 0) {
+            by = 0;
+        }
+
+        auto drawBox = reinterpret_cast<void (*)(void*, int, int, int, int,
+                                                 unsigned)>(
+            g_base + kDrawTextureBoxOff);
+        drawBox(batch, bx, by, boxW, boxH, 0xFFFFFFFFu);
+        const unsigned ink =
+            *reinterpret_cast<unsigned*>(g_base + kGameTextColorOff);
+        int textX = bx + kPadX;
+        if (haveIcon) {
+            /* Same arithmetic the gift tooltip uses: the standard object
+             * sheet is 24 columns of 16x16, so no Texture2D.get_Width call
+             * (a managed getter in a render hook is what froze a console in
+             * v392). */
+            NullableRect src{};
+            src.x = srcX;
+            src.y = srcY;
+            src.w = 16;
+            src.h = 16;
+            src.present = 1;
+            /* Centred on the FIRST line -- that is the line the icon belongs
+             * to, and the block centre would put it in the gap between the two
+             * lines.  When the font is shorter than the icon the centre would
+             * push it above the padding and onto the 12px frame, so the top
+             * edge is clamped to the padding instead. */
+            int iy = by + kPadY + (lineH - kIcon) / 2;
+            if (iy < by + kPadY) {
+                iy = by + kPadY;
+            }
+            const u64 dxy =
+                (static_cast<u64>(static_cast<u32>(iy)) << 32) |
+                static_cast<u32>(bx + kPadX);
+            const u64 dwh =
+                (static_cast<u64>(static_cast<u32>(kIcon)) << 32) |
+                static_cast<u32>(kIcon);
+            auto drawSprite =
+                reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+            drawSprite(batch, sheet, dxy, dwh, &src, 0xFFFFFFFFu,
+                       0.0f, 0.0f, 0.0f, 1.0f, 0);
+            /* Quality star, drawn over the icon's bottom-right corner the way
+             * the game does it on item icons.  8x8 source, 3x here so it reads
+             * next to a 32px icon. */
+            if (nextQ == 0 && (quality == 1 || quality == 2 || quality == 4)) {
+                void* cursors =
+                    *reinterpret_cast<void**>(g_base + kMouseCursorsOff);
+                if (Plausible(cursors)) {
+                    NullableRect qsrc{};
+                    if (quality == 4) {
+                        qsrc.x = 346;
+                        qsrc.y = 392;
+                    }
+                    else {
+                        qsrc.x = quality == 1 ? 338 : 346;
+                        qsrc.y = 400;
+                    }
+                    qsrc.w = 8;
+                    qsrc.h = 8;
+                    qsrc.present = 1;
+                    /* Vanilla proportion: an 8px star on a 16px icon, so 16px
+                     * on our 32px icon, sitting on the bottom-right corner and
+                     * sticking out by a couple of pixels. */
+                    const int qs = 16;
+                    const int qx2 = bx + kPadX + kIcon - 14;
+                    const int qy2 = iy + kIcon - 14;
+                    const u64 qdxy =
+                        (static_cast<u64>(static_cast<u32>(qy2)) << 32) |
+                        static_cast<u32>(qx2);
+                    const u64 qdwh =
+                        (static_cast<u64>(static_cast<u32>(qs)) << 32) |
+                        static_cast<u32>(qs);
+                    auto drawSprite = reinterpret_cast<DrawSpriteFn>(
+                        g_base + kDrawSpriteOff);
+                    drawSprite(batch, cursors, qdxy, qdwh, &qsrc, 0xFFFFFFFFu,
+                               0.0f, 0.0f, 0.0f, 1.0f, 0);
+                }
+            }
+            /* v467: the next tier's star goes on the SECOND line, centred in
+             * the icon column.  The column is already reserved for the icon, so
+             * the box does not grow and the two lines stay left-aligned. */
+            if (nextQ != 0 && lines > 1) {
+                void* cursors =
+                    *reinterpret_cast<void**>(g_base + kMouseCursorsOff);
+                if (Plausible(cursors)) {
+                    NullableRect nsrc{};
+                    if (nextQ == 4) {
+                        nsrc.x = 346;
+                        nsrc.y = 392;
+                    }
+                    else {
+                        nsrc.x = nextQ == 1 ? 338 : 346;
+                        nsrc.y = 400;
+                    }
+                    nsrc.w = 8;
+                    nsrc.h = 8;
+                    nsrc.present = 1;
+                    const int ns = 16;
+                    const int nx = bx + kPadX + (kIcon - ns) / 2;
+                    const int ny = by + kPadY + lineH + (lineH - ns) / 2;
+                    const u64 ndxy =
+                        (static_cast<u64>(static_cast<u32>(ny)) << 32) |
+                        static_cast<u32>(nx);
+                    const u64 ndwh =
+                        (static_cast<u64>(static_cast<u32>(ns)) << 32) |
+                        static_cast<u32>(ns);
+                    auto drawSprite = reinterpret_cast<DrawSpriteFn>(
+                        g_base + kDrawSpriteOff);
+                    drawSprite(batch, cursors, ndxy, ndwh, &nsrc, 0xFFFFFFFFu,
+                               0.0f, 0.0f, 0.0f, 1.0f, 0);
+                }
+            }
+            /* Both lines shift right, so the block stays a block; the box was
+             * widened by exactly this much above. */
+            textX += kIcon + kGap;
+        }
+        auto drawString = reinterpret_cast<DrawStringFn>(g_base + kDrawStringOff);
+        drawString(batch, font, msg, ink, static_cast<float>(textX),
+                   static_cast<float>(by + kPadY));
+    }
+
+    /* v448: growth of the crop on the tile in front (Mod page switch). */
+    void DrawCropLabel(void* batch) {
+        /* Belt and braces: the build already clears s_cropShow when the switch
+         * is off, but a switch flipped between the two hooks must not draw one
+         * more frame. */
+        if (g_cropOn == 0) {
+            return;
+        }
+        if (s_cropShow == 0 || !CachedStrOk(s_cropLine)) {
+            return;
+        }
+        DrawTileLabel(batch, s_cropTx, s_cropTy, s_cropLine.obj, s_cropW,
+                      s_cropIconSheet, s_cropIconX, s_cropIconY, 2, 0, 0);
+    }
+
+    /* v454: what the machine in front is making, and how long it has left.
+     * v457: shares the crop label's switch (Mod page 作物/机器提示). */
+    void DrawMachineLabel(void* batch) {
+        if (g_cropOn == 0) {
+            return;
+        }
+        if (s_machShow == 0 || !CachedStrOk(s_machLine)) {
+            return;
+        }
+        DrawTileLabel(batch, s_machTx, s_machTy, s_machLine.obj, s_machW,
+                      s_machIconSheet, s_machIconX, s_machIconY, s_machLines,
+                      s_machQuality, s_machNextQ);
+    }
+
     void DrawHudInfo() {
         if (!kHudInfo || g_hudOn == 0) {
             return;
         }
         /* Nothing here may allocate: every string below was built in the
-         * update hook.  DrawHudString ignores a null or implausible object. */
-        DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
+         * update hook.  DrawHudString ignores a null or implausible object.
+         *
+         * Every line is gated on CachedStrOk() first.  Build and draw run in
+         * DIFFERENT hooks (Game1.Update vs drawHUD), and these strings have no
+         * GC root, so a collection between the two frees them; Plausible()
+         * cannot tell a freed block from a live one (it keeps its method
+         * table), and the font code would then read a length out of whatever
+         * reused the memory.  Skipping the line costs one frame of text; not
+         * skipping it is a crash at exactly the moments that allocate hardest
+         * -- opening the menu, loading a save.  The diagnostic lines have
+         * always done this; the four info lines did not. */
+        if (CachedStrOk(s_weatherLine)) {
+            DrawHudString(s_weatherLine.obj, kHudTextX, kHudTextY, 0xFFFFFFFFu);
+        }
         /* Our own art, encoded as filled rectangles: no texture to load.
          * The slot is null until that icon has been drawn, so a missing
          * icon simply shows the text alone instead of drawing garbage. */
@@ -20044,8 +21885,10 @@ namespace {
         /* Daily luck.  Icon comes from the game's own cursor sheet -- the same
          * 10x14 region UI Info Suite 2 uses -- tinted by tier so the colour
          * answers the question before you read the number. */
-        DrawHudString(s_luckLine.obj, kHudCol1X + 72, kHudLuckTextY,
-                      0xFFFFFFFFu);
+        if (CachedStrOk(s_luckLine)) {
+            DrawHudString(s_luckLine.obj, kHudCol1X + 72, kHudLuckTextY,
+                          0xFFFFFFFFu);
+        }
         {
             void* batch =
                 *reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff);
@@ -20171,10 +22014,23 @@ namespace {
                     }
                 }
             }
-            DrawHudString(s_bdayLine.obj,
-                          static_cast<float>(bdayColX + 72),
-                          static_cast<float>(bdayRowY + 20), 0xFFFFFFFFu);
+            if (CachedStrOk(s_bdayLine)) {
+                DrawHudString(s_bdayLine.obj,
+                              static_cast<float>(bdayColX + 72),
+                              static_cast<float>(bdayRowY + 20), 0xFFFFFFFFu);
+            }
         }
+
+        /* Gift hint sits on its own row: the birthday row already shares its
+         * width with the portrait and the tool column, and a gift name is
+         * longer than a person's name.  Same colour as every other HUD row --
+         * a dimmer one read as a different kind of text rather than as part of
+         * the same block (user, 2026-11-10). */
+        if (g_giftOn != 0 && s_giftShow != 0 && CachedStrOk(s_giftLine)) {
+            DrawHudString(s_giftLine.obj, kHudTextX,
+                          static_cast<float>(bdayRowY + 50), 0xFFFFFFFFu);
+        }
+
 
         /* Tool upgrade countdown: only when something is actually upgrading. */
         if (s_lastUpgradeDays <= 0) {
@@ -20216,6 +22072,9 @@ namespace {
                 DrawIconRuns(white, kHud_tool.runs, kHud_tool.count,
                              kHudToolX, kHudToolY, kHudToolScale);
             }
+        }
+        if (!CachedStrOk(s_upgradeLine)) {
+            return;
         }
         DrawHudString(s_upgradeLine.obj, kHudTextX, kHudToolTextY,
                       0xFFFFFFFFu);
@@ -20366,9 +22225,511 @@ namespace {
          * a closed batch throws a managed exception.  Before the call the
          * batch is definitely open. */
         DrawHudInfo();
+        /* v448: outside DrawHudInfo on purpose -- the crop label is its own
+         * feature and must still appear when the HUD switch is off. */
+        DrawCropLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
+        /* v454: the machine label is a separate feature (no switch of its own
+         * yet -- the preferences int has no free bit left). */
+        DrawMachineLabel(*reinterpret_cast<void**>(g_base + kGame1SpriteBatchOff));
         s_origDrawHud(self);
         if (kDiagNoDraw) {
             return;
+        }
+    }
+
+    /* Calendar: which day cell the cursor is over.
+     *
+     * The game keeps a List<ClickableTextureComponent> of 28 cells and copies
+     * that cell's tooltip in performHoverAction.  Walking a managed List from
+     * here would mean reading a Rectangle out of each component; the geometry
+     * is a fixed formula instead (Billboard's ctor):
+     *
+     *   cell i (1..28), n = i - 1
+     *   x = xPos + 152 + (n % 7) * 128
+     *   y = yPos + 200 + (n / 7) * 128
+     *   box 124x124 -- 124..127 is the gap between cells
+     *
+     * xPos/yPos are IClickableMenu fields at +0x28 / +0x2c.  calendarDays is at
+     * +0x80 and is null on the quest board, which shares this class; that null
+     * is the guard that keeps this from firing on a layout it does not match.
+     */
+    void HookBillboardHover(void* self, int mx, int my) {
+        if (s_origBillboardHover != nullptr) {
+            s_origBillboardHover(self, mx, my);
+        }
+        s_calDay = 0;
+        if (self == nullptr || !Plausible(self) || !RangeReadable(self, 0xA0u)) {
+            return;
+        }
+        unsigned char* b = reinterpret_cast<unsigned char*>(self);
+        if (*reinterpret_cast<void**>(b + 0x80) == nullptr) {
+            return;
+        }
+        const int x0 = *reinterpret_cast<int*>(b + 0x28);
+        const int y0 = *reinterpret_cast<int*>(b + 0x2c);
+        const int dx = mx - (x0 + 152);
+        const int dy = my - (y0 + 200);
+        if (dx < 0 || dy < 0) {
+            return;
+        }
+        const int col = dx / 128;
+        const int row = dy / 128;
+        if (col > 6 || row > 3) {
+            return;
+        }
+        if ((dx % 128) >= 124 || (dy % 128) >= 124) {
+            return;          /* the gap, not a cell */
+        }
+        s_calDay = row * 7 + col + 1;
+        s_calX = mx;
+        s_calY = my;
+    }
+
+    /* The hint, drawn into the band between the month title and the grid --
+     * always the same place, so it never collides with the game's own tooltip
+     * (which follows the cursor) and never runs off the screen edge.
+     *
+     * Drawing AFTER the original is safe here: Billboard.draw never calls
+     * Begin/End on the batch, so the one Game1 opened is still open when we
+     * return.  drawHUD is the opposite case -- that hook draws before its
+     * original precisely because the batch state after it is unknown.
+     */
+    /* The tooltip itself: a dark box at the cursor, one row per loved gift,
+     * sprite on the left and name on the right -- the shape GiftTasteHelper
+     * draws, built out of the two primitives this module already uses (a
+     * stretched 1x1 for the box, the object sheet for the icons).
+     *
+     * Drawing AFTER the original is safe here: Billboard.draw never calls
+     * Begin/End on the batch, so the one Game1 opened is still open when we
+     * return.  drawHUD is the opposite case -- that hook draws before its
+     * original precisely because the batch state after it is unknown.
+     */
+    /* The gift tooltip box.
+     *
+     * A dark panel at the cursor, one row per loved gift: the gift's own
+     * sprite on the left, its name on the right.  This is the shape
+     * GiftTasteHelper draws; here it is built from the two primitives this
+     * module already uses (a stretched white pixel for the panel, the object
+     * sheet for the icons).
+     *
+     * Both entry points -- the calendar and the social page -- come through
+     * here, so the two tooltips cannot drift apart. */
+    void DrawGiftTooltip(void* batch, const gift::Entry* g, int mx, int my,
+                         const CachedStr* names, int count,
+                         int bL, int bT, int bR, int bB, bool aboveCursor) {
+        /* Belt and braces: both callers already check g_giftOn, but this is the
+         * one function that actually puts pixels on the screen, and a future
+         * caller must not be able to bypass the switch by forgetting to. */
+        if (g_giftOn == 0) {
+            return;
+        }
+        if (g == nullptr || names == nullptr || count <= 0 || batch == nullptr) {
+            return;
+        }
+        /* Never index past what the entry actually has: a stale caller count
+         * would otherwise reach into the next NPC's slice. */
+        if (count > static_cast<int>(g->count)) {
+            count = static_cast<int>(g->count);
+        }
+        if (count > gift::MAX_ITEMS) {
+            count = gift::MAX_ITEMS;
+        }
+        void* sheet = *reinterpret_cast<void**>(g_base + kObjectSheetOff);
+        void* white = *reinterpret_cast<void**>(g_base + kStaminaRectOff);
+        if (!Plausible(sheet) || !Plausible(white)) {
+            return;
+        }
+        void* view = reinterpret_cast<void*>(g_base + kViewportOff);
+        const int vw = *reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(view) + 8);
+        const int vh = *reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(view) + 12);
+        if (vw <= 0 || vh <= 0) {
+            return;
+        }
+
+        /* The panel is a 9-slice whose corners are 12px wide at scale 1, so
+         * anything drawn closer than ~14px to an edge lands ON the frame.
+         * The first version put the icons at bx+6, which clipped their left
+         * column against the border -- the content looked like it overflowed
+         * the box.  Every inset below is therefore >= 12, and the box grew to
+         * match so the longest name still fits. */
+        constexpr int kPad = 14;      /* left/right inset */
+        constexpr int kPadY = 22;     /* top/bottom inset -- see below */
+        constexpr int kIcon = 16;     /* the object sprite, 16x16 */
+        constexpr int kGap = 8;       /* icon -> name */
+        constexpr int kRowH = 22;
+        /* How tall one line of text is.  SpriteFont.LineSpacing is an int at
+         * +0x2C (get_LineSpacing 0x0C7290 is `ldr w0,[x0,#0x2c]`), and it is
+         * what the icon has to be centred against -- the first version put
+         * both at the same y, which aligns their TOPS, so the icon sat a
+         * couple of pixels high. */
+        int lineH = 20;
+        {
+            void* font = *reinterpret_cast<void**>(g_base + kGame1SmallFontOff);
+            if (font != nullptr && Plausible(font) && RangeReadable(font, 0x30u)) {
+                const int v = *reinterpret_cast<int*>(
+                    reinterpret_cast<unsigned char*>(font) + 0x2C);
+                if (v >= 12 && v <= 40) {
+                    lineH = v;
+                }
+            }
+        }
+        /* Keep the row pitch the user already accepted (22) unless the font
+         * really is taller than that; only then grow it. */
+        const int rowH = lineH > kRowH ? lineH + 2 : kRowH;
+        /* Width follows the longest name instead of being a fixed 212: the
+         * old box left ~80px of empty space on the right.
+         *
+         * 22px per character, not 18.  Measured off a screenshot of the
+         * running build: a 5-character name is ~105px wide at scale 1, so the
+         * old estimate was short by enough that the text sat ON the right
+         * frame.  SpriteFont.MeasureString would be exact, but the
+         * string overload builds a StringBuilder first -- an allocation, and
+         * this runs inside a draw hook.
+         *
+         * Every name here is Chinese (the generator drops anything else), so a
+         * per-character estimate is the right shape; the trailing kPadR is
+         * what the eye reads as the right margin. */
+        constexpr int kCharW = 22;
+        constexpr int kPadR = 18;
+        int maxLen = 1;
+        for (int i = 0; i < count; ++i) {
+            if (names[i].len > maxLen) {
+                maxLen = names[i].len;
+            }
+        }
+        const int boxW = kPad + kIcon + kGap + maxLen * kCharW + kPadR;
+        /* Top and bottom: the icon and the text both start at their own top
+         * edge, so they need more room than the sides or they sit on the 12px
+         * frame.  Content is (count-1) row pitches plus one line of text. */
+        const int contentH = (count - 1) * rowH + (lineH > kIcon ? lineH : kIcon);
+        const int boxH = kPadY * 2 + contentH;
+        /* Centre the 16px icon on the text's line box. */
+        const int iconDy = lineH / 2 - kIcon / 2;
+        /* Keep the box inside the menu it belongs to, not just inside the
+         * screen.  The social page is a narrow panel with the friendship
+         * hearts to its right, so a box anchored at the cursor spilled over
+         * its border and looked like it belonged to nothing.
+         *
+         * Order: prefer below-right of the cursor; flip to the left when that
+         * would leave the menu; then clamp to the menu; then to the screen (in
+         * case a caller passes nonsense bounds). */
+        if (bR <= bL || bB <= bT) {
+            bL = 0;
+            bT = 0;
+            bR = vw;
+            bB = vh;
+        }
+        int bx = mx + 24;
+        /* Vertical placement.  The calendar is the case that matters: while a
+         * birthday cell is hovered, Billboard.draw calls
+         * `drawHoverText(b, hoverText, dialogueFont)` with the default offsets,
+         * i.e. the game's own "X的生日" panel sits exactly AT the cursor and is
+         * about 150x60.  Anything drawn at cursor+24 lands on top of it.
+         *
+         * So when the caller says so, go above the cursor first -- the game's
+         * hint is at and below it, so a box entirely above cannot collide.
+         * If the panel has no room up there, drop BELOW the hint (my + 64)
+         * rather than just below the cursor. */
+        int by;
+        if (aboveCursor) {
+            by = my - boxH - 8;
+            if (by < bT) {
+                by = my + 64;
+            }
+        }
+        else {
+            by = my + 24;
+        }
+        if (bx + boxW > bR) {
+            bx = mx - boxW - 24;
+        }
+        if (bx + boxW > bR) {
+            bx = bR - boxW;
+        }
+        if (bx < bL) {
+            bx = bL;
+        }
+        if (by + boxH > bB) {
+            by = bB - boxH;
+        }
+        if (by < bT) {
+            by = bT;
+        }
+        if (bx + boxW > vw) {
+            bx = vw - boxW;
+        }
+        if (by + boxH > vh) {
+            by = vh - boxH;
+        }
+        if (bx < 0) {
+            bx = 0;
+        }
+        if (by < 0) {
+            by = 0;
+        }
+
+        auto drawSprite = reinterpret_cast<DrawSpriteFn>(g_base + kDrawSpriteOff);
+        /* The panel: the game's own menu patch, 9-sliced.  A hand-drawn
+         * rectangle never looks like part of the game, which is what the user
+         * said about the first version -- this is literally the same call
+         * IClickableMenu.drawHoverText makes for its background. */
+        {
+            auto drawBox = reinterpret_cast<void (*)(void*, int, int, int, int,
+                                                     unsigned)>(
+                g_base + kDrawTextureBoxOff);
+            drawBox(batch, bx, by, boxW, boxH, 0xFFFFFFFFu);
+        }
+        const unsigned ink =
+            *reinterpret_cast<unsigned*>(g_base + kGameTextColorOff);
+        s_tipX = bx;
+        s_tipY = by;
+        s_tipW = boxW;
+
+        for (int i = 0; i < count; ++i) {
+            if (!CachedStrOk(names[i])) {
+                continue;
+            }
+            const int iy = by + kPadY + i * rowH;
+            const int sprite = gift::At(*g, i).sprite;
+            /* `present` and the padding are part of the ABI: DrawSprite takes
+             * this struct as a Nullable<Rectangle> and reads the flag.  This
+             * one place never set them -- it worked only because the stack
+             * happened to hold a 1 there, and the moment this function grew a
+             * few locals the icons turned into one repeated blob.  Value-
+             * initialise, then set the flag, so a field added later is zero. */
+            NullableRect src{};
+            src.x = (sprite % 24) * 16;
+            src.y = (sprite / 24) * 16;
+            src.w = 16;
+            src.h = 16;
+            src.present = 1;
+            const u64 dxy =
+                (static_cast<u64>(static_cast<u32>(iy + iconDy)) << 32) |
+                static_cast<u32>(bx + kPad);
+            const u64 dwh = (static_cast<u64>(16u)) << 32 | static_cast<u32>(16u);
+            drawSprite(batch, sheet, dxy, dwh, &src, 0xFFFFFFFFu,
+                       0.0f, 0.0f, 0.0f, 1.0f, 0);
+            DrawHudString(names[i].obj,
+                          static_cast<float>(bx + kPad + kIcon + kGap),
+                          static_cast<float>(iy), ink);
+        }
+    }
+
+    /* The gift table is keyed by the NPC's internal name.  The social page
+     * hands us that name as a managed string, so the lookup compares in place
+     * instead of copying it out. */
+    const gift::Entry* GiftForManagedName(const void* managed) {
+        if (managed == nullptr) {
+            return nullptr;
+        }
+        for (int i = 0; i < gift::kCount; ++i) {
+            if (NameEquals(managed, gift::kTable[i].en)) {
+                return &gift::kTable[i];
+            }
+        }
+        return nullptr;
+    }
+
+    /* Social page: which entry is the cursor over?
+     *
+     * The page itself only reacts to the up/down buttons, so the hover test is
+     * ours: walk the visible slots (slotPosition .. slotPosition+4) and ask
+     * each one's own bounds rectangle.  That is exactly what the game's own
+     * click test does (SocialPage.receiveLeftClick walks characterSlots with
+     * the same index range).
+     *
+     * Called from the draw hook with the same coordinates the menu itself uses
+     * (Game1.getMouseX/getMouseY), so no hover hook is needed -- which is just
+     * as well, because performHoverAction cannot be hooked at all. */
+    int SocialHoveredEntry(void* self, int mx, int my) {
+        s_giftDbg &= ~0x3u;
+        if (self == nullptr || !Plausible(self) || !RangeReadable(self, 0xB8u)) {
+            return -1;
+        }
+        unsigned char* b = reinterpret_cast<unsigned char*>(self);
+        void* slots = *reinterpret_cast<void**>(b + kSocialSlotsOff);
+        if (slots == nullptr || !Plausible(slots) || !RangeReadable(slots, 0x1Cu)) {
+            return -1;
+        }
+        void* wrapper = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(slots) + 0x10);
+        if (wrapper == nullptr || !Plausible(wrapper) ||
+            !RangeReadable(wrapper, 0x28u)) {
+            return -1;
+        }
+        void** buf = *reinterpret_cast<void***>(
+            reinterpret_cast<unsigned char*>(wrapper) + 0x10);
+        const int count = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(slots) + 0x18);
+        if (buf == nullptr || count <= 0) {
+            return -1;
+        }
+        s_giftDbg |= 0x1u;
+        const int first = *reinterpret_cast<int*>(b + kSocialSlotPosOff);
+        const int from = first > 0 ? first : 0;
+        for (int j = from; j < from + 5 && j < count; ++j) {
+            void* comp = buf[j];
+            if (comp == nullptr || !Plausible(comp) || !RangeReadable(comp, 0x20u)) {
+                continue;
+            }
+            const int* rect = reinterpret_cast<const int*>(
+                reinterpret_cast<unsigned char*>(comp) + kBoundsOff);
+            const int rx = rect[0];
+            const int ry = rect[1];
+            const int rw = rect[2];
+            const int rh = rect[3];
+            if (rw <= 0 || rh <= 0) {
+                continue;
+            }
+            if (mx >= rx && mx < rx + rw && my >= ry && my < ry + rh) {
+                s_giftDbg |= 0x2u;
+                return j;
+            }
+        }
+        return -1;
+    }
+
+    /* Draw the social page's gift tooltip, after the game's own draw so the
+     * panel lands on top of the portrait row. */
+    void HookSocialDraw(void* self, void* batch) {
+        if (s_origSocialDraw != nullptr) {
+            s_origSocialDraw(self, batch);
+        }
+        if (!kGiftHint || g_giftOn == 0) {
+            return;
+        }
+        /* Same coordinates the menu's own performHoverAction would have been
+         * given.  Asking Game1 is safe; hooking that function is not. */
+        const int mx = reinterpret_cast<int (*)()>(g_base + kGetMouseXOff)();
+        const int my = reinterpret_cast<int (*)()>(g_base + kGetMouseYOff)();
+        s_socialEntry = SocialHoveredEntry(self, mx, my);
+        if (s_socialEntry < 0) {
+            return;
+        }
+        s_socialX = mx;
+        s_socialY = my;
+        if (self == nullptr || !Plausible(self) || !RangeReadable(self, 0xB8u)) {
+            return;
+        }
+        void* list = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(self) + kSocialEntriesOff);
+        if (list == nullptr || !Plausible(list) || !RangeReadable(list, 0x1Cu)) {
+            return;
+        }
+        void* wrapper = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(list) + 0x10);
+        if (wrapper == nullptr || !Plausible(wrapper) ||
+            !RangeReadable(wrapper, 0x28u)) {
+            return;
+        }
+        void** buf = *reinterpret_cast<void***>(
+            reinterpret_cast<unsigned char*>(wrapper) + 0x10);
+        const int count = *reinterpret_cast<int*>(
+            reinterpret_cast<unsigned char*>(list) + 0x18);
+        if (buf == nullptr || s_socialEntry >= count) {
+            return;
+        }
+        void* entry = buf[s_socialEntry];
+        if (entry == nullptr || !Plausible(entry) || !RangeReadable(entry, 0x38u)) {
+            return;
+        }
+        /* GiftTasteHelper hides the tooltip for NPCs you have not met
+         * (ShowGiftsForUnmetNPCs defaults to false), so the same rule applies
+         * here.  SocialEntry.IsMet is the game's own answer to that question. */
+        const unsigned char met = *reinterpret_cast<const unsigned char*>(
+            reinterpret_cast<unsigned char*>(entry) + kSocialEntryMetOff);
+        if (met == 0) {
+            s_giftDbg |= 0x10u;
+            return;
+        }
+        void* name = *reinterpret_cast<void**>(
+            reinterpret_cast<unsigned char*>(entry) + kSocialEntryNameOff);
+        const gift::Entry* g = GiftForManagedName(name);
+        if (g == nullptr || g->count == 0) {
+            return;
+        }
+        s_giftDbg |= 0x4u;
+        if (s_socKey != s_socialEntry) {
+            s_socKey = s_socialEntry;
+            s_socCount = 0;
+            for (int i = 0; i < g->count && i < gift::MAX_ITEMS; ++i) {
+                const char16_t* nm = gift::At(*g, i).name;
+                int n = 0;
+                while (nm[n] != 0) {
+                    ++n;
+                }
+                CachedStrBuild(&s_socName[i], nm, n);
+                ++s_socCount;
+            }
+        }
+        s_giftDbg |= 0x8u;
+        {
+            const unsigned char* b =
+                reinterpret_cast<const unsigned char*>(self);
+            const int l = *reinterpret_cast<const int*>(b + 0x28);
+            const int t = *reinterpret_cast<const int*>(b + 0x2C);
+            const int w = *reinterpret_cast<const int*>(b + 0x30);
+            const int h = *reinterpret_cast<const int*>(b + 0x34);
+            /* GameMenu builds this page 36px WIDER than its own panel:
+             *     pages.Add(new SocialPage(x, y, width + 36, height));
+             * so the page's right edge sits 36px past the visible border and
+             * clamping to it still let the box spill over.  The panel is what
+             * the border is drawn around, so that is what to clamp to. */
+            constexpr int kPageOverhang = 36;
+            s_pgL = l;
+            s_pgW = w;
+            s_tipW = 0;
+            DrawGiftTooltip(batch, g, s_socialX, s_socialY, s_socName,
+                            s_socCount, l, t, l + w - kPageOverhang, t + h,
+                            false);
+        }
+    }
+
+    void HookBillboardDraw(void* self, void* batch) {
+        if (s_origBillboardDraw != nullptr) {
+            s_origBillboardDraw(self, batch);
+        }
+        if (s_calDay < 1 || s_calDay > 28 || s_wxValid == 0) {
+            return;
+        }
+        if (self == nullptr || !Plausible(self) || !RangeReadable(self, 0xA0u)) {
+            return;
+        }
+        if (!kGiftHint || g_giftOn == 0) {
+            return;
+        }
+        const char* en = BirthdayEnglish(s_wxSeason, s_calDay);
+        const gift::Entry* g = gift::Find(en);
+        if (g == nullptr || g->count == 0) {
+            return;
+        }
+
+        /* Rebuild the name strings only when the hovered NPC (or the season,
+         * which can change the NPC for the same cell) changes. */
+        if (s_calNpc != en || s_calSeason != s_wxSeason) {
+            s_calNpc = en;
+            s_calSeason = s_wxSeason;
+            s_calCount = 0;
+            for (int i = 0; i < g->count && i < gift::MAX_ITEMS; ++i) {
+                const char16_t* nm = gift::At(*g, i).name;
+                int n = 0;
+                while (nm[n] != 0) {
+                    ++n;
+                }
+                CachedStrBuild(&s_calName[i], nm, n);
+                ++s_calCount;
+            }
+        }
+
+        {
+            const unsigned char* b =
+                reinterpret_cast<const unsigned char*>(self);
+            const int l = *reinterpret_cast<const int*>(b + 0x28);
+            const int t = *reinterpret_cast<const int*>(b + 0x2C);
+            const int w = *reinterpret_cast<const int*>(b + 0x30);
+            const int h = *reinterpret_cast<const int*>(b + 0x34);
+            DrawGiftTooltip(batch, g, s_calX, s_calY, s_calName, s_calCount,
+                            l, t, l + w, t + h, true);
         }
     }
 
@@ -20474,6 +22835,9 @@ extern "C" void exl_main(void* x0, void* x1) {
         { 0x01ADFC30u, 0xA9BD7BFDu, 0xF9000BF5u },
         { 0x01443540u, 0xB005A8C8u, 0x9108A108u },
         { 0x017FBA90u, 0xD10683FFu, 0xA9147BFDu },
+        { 0x01722D60u, 0xD10183FFu, 0xFD0013E8u },
+        { 0x01723230u, 0x6DB63BEFu, 0x6D0133EDu },
+        { 0x01841DF0u, 0xD10683FFu, 0xA9147BFDu },
         { 0x01400090u, 0x39429008u, 0x34000088u },
         { 0x014888D0u, 0x6DB63BEFu, 0x6D0133EDu },
         { 0x01440570u, 0xF005A8C8u, 0x912D4108u },
@@ -20629,6 +22993,18 @@ extern "C" void exl_main(void* x0, void* x1) {
         HOOKF(base + 0x17FBA90, &HookOptionsPageDraw, true));
     LOGF("options: draw hook installed, trampoline %p",
          reinterpret_cast<void*>(s_origOptionsDraw));
+
+    s_origBillboardHover = reinterpret_cast<void (*)(void*, int, int)>(
+        HOOKF(base + kBillboardHoverOff, &HookBillboardHover, true));
+    s_origBillboardDraw = reinterpret_cast<void (*)(void*, void*)>(
+        HOOKF(base + kBillboardDrawOff, &HookBillboardDraw, true));
+
+    /* The social page: ONE hook, on draw.  Its performHoverAction is not
+     * hookable (pre-indexed SP write) -- see the note on kSocialDrawOff. */
+    if (kGiftHint) {
+        s_origSocialDraw = reinterpret_cast<void (*)(void*, void*)>(
+            HOOKF(base + kSocialDrawOff, &HookSocialDraw, true));
+    }
 
     s_origCheckSingle = reinterpret_cast<bool (*)(void*, void*)>(
         HOOKF(base + 0x1400090, &HookCheckSingleAnimation, true));

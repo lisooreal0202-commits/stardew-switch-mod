@@ -3411,7 +3411,11 @@ public:
         list->addItem(save);
 
         list->addItem(new tsl::elm::CategoryHeader("快捷时刻"));
-        static const u32 kPresets[] = { 600, 900, 1200, 1800, 2200, 2600 };
+        /* 2600 is 02:00 and is a real in-game time, but it is NOT a legal target: the
+     * mod refuses anything above 2550 because stepping to 2600 would trip the
+     * pass-out path.  The preset was therefore a button that always answered
+     * "目标非法".  Replaced with 2500 so every preset can actually be written. */
+    static const u32 kPresets[] = { 600, 900, 1200, 1800, 2200, 2500 };
         for (u32 v : kPresets) {
             auto* p = new tsl::elm::ListItem(clockText(v), "设为待写入");
             p->setClickListener([this, v](u64 keys) {
