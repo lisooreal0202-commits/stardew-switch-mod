@@ -608,7 +608,7 @@ namespace {
      * which file is actually running is to look at the screen -- and twice now
      * a screenshot turned out to be an older build than the one that had just
      * been handed over.  Keep it equal to the `builds/vNNN-...` number. */
-    constexpr int kBuildNo = 469;
+    constexpr int kBuildNo = 474;
     constexpr int kMapStage = 327;
     /* The avatar block and its build tag both derive from this one constant, so
      * the switch and the gate can never disagree again.  Twice now (stage 44 and
@@ -12484,12 +12484,51 @@ namespace {
         /* `capacity == -1 ? 36 : capacity`, and the slot-building loop bound. */
         ok = PatchInstr(0x17A7DF4u, 0x52800488u, 0x30u, 5, 0xFFFFu) && ok;
         ok = PatchInstr(0x17A8114u, 0x7100901Fu, 0x30u, 10, 0xFFFu) && ok;
-        /* The rows argument (arg 8, w7).  The column count is derived as
-         * capacity / rows, so leaving rows at 3 with 48 slots gives 3x16.
-         * InventoryMenu.height = 64 * rows + 16 comes from that same register
-         * and becomes 272 on its own -- v242's extra patch on 0x17A7E04 is
-         * gone.  That field is not drawn; the brown box is the PAGE height. */
-        ok = PatchWord(0x17A7D20u, 0x2A0703F7u, 0x52800097u) && ok;
+
+        /* ---- 1a. rows at the call sites, NOT in the ctor -------------- */
+        /* v239 patched the ctor itself (0x17A7D20 `mov w23, w7` ->
+         * `mov w23, #4`), which ignores the rows the caller passed: every
+         * menu that builds a 3-row InventoryMenu on purpose (chest contents,
+         * geode, forge, tailoring, dresser) turned into 48/4 = 3 rows of 16
+         * and drew rows of empty slots.  The ctor now stays untouched; rows
+         * only rise at the ten call sites that build the PLAYER's grid with
+         * rows=3 / capacity=-1.  There are 20 `bl InventoryMenu..ctor`
+         * sites; 12 carry `mov w7, #3`, ten are these, the other two build a
+         * chest's own grid (1b) and must keep 3 rows.
+         * `mov w7, #3` = 0x52800067 -> `mov w7, #4` = 0x52800087. */
+        ok = PatchWord(0x176DFACu, 0x52800067u, 0x52800087u) && ok;  /* CraftingPage..ctor */
+        ok = PatchWord(0x1782C20u, 0x52800067u, 0x52800087u) && ok;  /* DyeMenu.gameWindowSizeChanged */
+        ok = PatchWord(0x1792260u, 0x52800067u, 0x52800087u) && ok;  /* ForgeMenu.gameWindowSizeChanged */
+        ok = PatchWord(0x179B77Cu, 0x52800067u, 0x52800087u) && ok;  /* GeodeMenu.gameWindowSizeChanged */
+        ok = PatchWord(0x17AD4D4u, 0x52800067u, 0x52800087u) && ok;  /* InventoryPage..ctor */
+        ok = PatchWord(0x17EEFD4u, 0x52800067u, 0x52800087u) && ok;  /* MenuWithInventory..ctor */
+        ok = PatchWord(0x17F025Cu, 0x52800067u, 0x52800087u) && ok;  /* MenuWithInventory.gameWindowSizeChanged */
+        ok = PatchWord(0x182395Cu, 0x52800067u, 0x52800087u) && ok;  /* ShopMenu: player grid */
+        ok = PatchWord(0x182FA98u, 0x52800067u, 0x52800087u) && ok;  /* ShopMenu.gameWindowSizeChanged */
+        ok = PatchWord(0x1853870u, 0x52800067u, 0x52800087u) && ok;  /* TailoringMenu.gameWindowSizeChanged */
+
+        /* ---- 1b. a chest's own grid stays 3x12 ------------------------ */
+        /* ItemGrabMenu builds the chest's contents with `capacity = -1`,
+         * which the patched ctor would turn into 48 slots / 4 rows.  Pin the
+         * argument to 36 instead: `mov w6, #-1` = 0x12800006 ->
+         * `mov w6, #0x24` = 0x52800486.  Big chests (capacity >= 70) take the
+         * explicit-capacity branch at 0x17B4CB0 and are not affected. */
+        ok = PatchWord(0x17B35B8u, 0x12800006u, 0x52800486u) && ok;  /* ItemGrabMenu chest grid */
+        ok = PatchWord(0x17B44B8u, 0x12800006u, 0x52800486u) && ok;  /* ItemGrabMenu chest grid (resize) */
+
+        /* ---- 1c. ShopMenu: the panel grows by 64, the coin box follows - */
+        /* ShopMenu builds its player grid at a hard-coded `y + 496`
+         * (96 + 40 + 320 + 40), so four rows reach `y + 768`; the brown panel
+         * behind it is `height - 448 + 20`, sized for three rows.  Grow the
+         * panel by one row (0x1830068 `sub w25, w12, #0x1AC` -> `#0x16C`,
+         * i.e. 252 -> 316) and move the money box that drawCurrency places at
+         * `y + height - inventory.height - 12` down by the same 64
+         * (0x182F734 `sub w3, w9, #0xC` -> `add w3, w9, #0x34`, -12 -> +52).
+         * The PC mod patches three more ShopMenu sites; they are identities
+         * in this build and would only give the fingerprint guard something to
+         * reject. */
+        ok = PatchInstr(0x1830068u, 0x5106B199u, 0x16Cu, 10, 0xFFFu) && ok;
+        ok = PatchWord(0x182F734u, 0x51003123u, 0x1100D123u) && ok;
 
         /* ---- 2. the brown box: page height +64 ------------------------ */
         /* GameMenu.draw does
@@ -12500,29 +12539,33 @@ namespace {
          * for base(IClickableMenu) and for the organize button's
          * `y + height / 3 - 64 + 8`.  Adding here covers both.
          *
-         * v245 used +32 and the hardware run showed the lowest text line
-         * ("test", the player name) sitting 12px above the bottom border.
-         * That is exactly what the arithmetic predicts: the name text is at
-         * `base + 456`, so its margin to the border is
-         *     (680 - 136 - 456 - 44) + growth - shift = 44 + growth - 64
-         * -- 12px at +32.  Vanilla has 44px, so the growth has to be 64, which
-         * is also what the PC mod uses.
-         *
-         * Is there room?  The box starts at `viewportHeight / 2 - 340`.  The
-         * v245 screenshot shows the bottom border fully on screen with the box
-         * 712 tall, i.e. `vh/2 - 340 + 712 <= vh`, so vh >= 744 -- 720p is
-         * ruled out, and at 1080p the box ends at 944 with 136px to spare. */
+         * v470..v473 tried to shave this to +20 to "make 720p fit", and every
+         * variant broke something, because the info block cannot be squeezed:
+         * the divider MUST sit under the fourth grid row (+64: 192 -> 256) and
+         * the portrait/text/equipment offsets are all measured from that same
+         * divider, so they need +64 too.  +20 frame with +64 content pressed
+         * the date line onto the bottom border (v470), +20/+20 rode the
+         * equipment row onto the divider (v471), and +20/+44 did the same,
+         * slightly less (v473 hardware).  The released v1.4 (v469) has the
+         * +64/+64 layout and is played on this very 720p handheld without the
+         * box being cut, so the "+64 cannot fit 720p" assumption from 11-13
+         * was wrong -- the UI viewport is taller than 720.  Back to +64/+64:
+         * one row of frame for one row of content, which is also exactly what
+         * the PC mod does. */
         ok = PatchWord(0x17AD3E4u, 0x2A0403F4u, 0x11010094u) && ok;
-        /* CraftingPage needs the same treatment, and it is the same one-word
-         * patch: its ctor also parks the height argument in w20
-         * (`0x176DECC mov w20, w4`, ctor at 0x176DEA0), then hands it to
+        /* CraftingPage: its ctor parks the same height argument in w20
+         * (`0x176DECC mov w20, w4`, ctor at 0x176DEA0), hands it to
          * base(IClickableMenu) at 0x176DF64 and reuses it at 0x176E070 for the
-         * trash can's `y + height - borderWidth - 328`.
+         * trash can's `y + height - borderWidth - 328`.  Same +64.
          *
-         * Its inventory sits at `base + 304` and is 4 rows now, so the grid
-         * ends at `base + 568` while the box bottom was `base + 544` -- the
-         * whole fourth row hung outside, which is what the screenshot shows.
-         * +64 puts the bottom at `base + 608`, a 40px margin. */
+         * Its inventory grid sits at a hard-coded `y + 136 + 304` (the ctor
+         * builds it at 0x176DFE0, `add w2, w8, #0x130`) and is four rows now,
+         * so it covers 440..696.  With the frame at +64 the box's inner bottom
+         * is 744 - 40 = 704, i.e. the fourth row lands 8px inside -- that is
+         * exactly why the PC mod only grows this ctor and never moves the
+         * grid.  (With the v470..473 frame at +20 the inner bottom was 660 and
+         * the row sat on the border; v473 moved the grid up 48 to compensate,
+         * which is no longer needed and is reverted here.) */
         ok = PatchWord(0x176DECCu, 0x2A0403F4u, 0x11010094u) && ok;
 
         /* ---- 3. components below the grid: +64 ------------------------ */
@@ -12530,7 +12573,11 @@ namespace {
          * These are `add w2, w8, #imm` -- w2 is a Rectangle's Y.  The X sites
          * are `add w1` and must NOT be touched (v239 did, and shoved three
          * icons sideways on top of the grid).  Then the portrait component
-         * (y+312), the trash can (y+256) and the trinket loop's base. */
+         * (y+312), the trash can (y+256) and the trinket loop's base.
+         * +64 keeps the vanilla spacing to the divider: 248 - 192 = 56px in
+         * vanilla, 312 - 256 = 56px here.  (v471..473 used +20/+44, which put
+         * the hat row 36px or 8px off the divider -- the "hat slot sits on the
+         * border" shot.) */
         ok = PatchInstr(0x17AD568u, 0x1103E102u, 0x138u, 10, 0xFFFu) && ok;  /* left ring   248->312 */
         ok = PatchInstr(0x17AD5ECu, 0x1104E102u, 0x178u, 10, 0xFFFu) && ok;  /* right ring  312->376 */
         ok = PatchInstr(0x17AD664u, 0x1105E102u, 0x1B8u, 10, 0xFFFu) && ok;  /* boots       376->440 */
@@ -12547,7 +12594,9 @@ namespace {
          *     add  w8, w8, w9         ; + borderWidth
          *     add  w8, w8, w10        ; + spaceToClearTopBorder
          *     add  w8, w8, #<K>       ; <- the constant patched below
-         * so each K simply grows by one row.  The X coordinates use
+         * so each K grows by one row (64) and the internal spacing stays
+         * vanilla: the date line ends 56px above the box's inner bottom, the
+         * portrait 56px below the divider.  The X coordinates use
          * [x20, #0x28] = xPositionOnScreen and stay untouched
          * (0x17B1DEC, 0x17B1F1C, 0x17B2130). */
         ok = PatchInstr(0x17B1504u, 0x11030102u, 0x100u, 10, 0xFFFu) && ok;  /* divider         192->256 */
@@ -12559,6 +12608,17 @@ namespace {
         ok = PatchInstr(0x17B2354u, 0x11051108u, 0x184u, 10, 0xFFFu) && ok;  /* funds           324->388 */
         ok = PatchInstr(0x17B2444u, 0x11060108u, 0x1C0u, 10, 0xFFFu) && ok;  /* total earnings  384->448 */
         ok = PatchInstr(0x17B24D8u, 0x11070108u, 0x200u, 10, 0xFFFu) && ok;  /* date            448->512 */
+
+        /* ---- 5. container menus: the drawn panel grows by 64 ---------- */
+        /* MenuWithInventory.draw (0x17EFB10) paints a narrow panel behind the
+         * player's grid with `sub w3, w8, #0xc0` at 0x17EFE00:
+         * top y+200, bottom y+height-128 (height 680 -> 552).  The grid sits
+         * at y+228 and its fourth row ends at y+484, so the last row stuck
+         * 60px out of the panel (v471 shot).  Stretching only that panel by
+         * 64 (`#0xc0` -> `#0x80`) encloses the row without moving the grid or
+         * growing the menu: +64 on the menu height would push
+         * `yPositionOnScreen` negative at 100% UI scale. */
+        ok = PatchWord(0x17EFE00u, 0x51030103u, 0x51020103u) && ok;
 
         s_bagPatched = ok;
         LOGF("bag: patches applied=%d", ok ? 1 : 0);
